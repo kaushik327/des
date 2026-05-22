@@ -39,7 +39,15 @@ enum Commands {
     Jackson,
     /// Run LLM inference scheduler comparison
     Llm,
-    /// Run all validations
+    /// Validate Little's Law (L = λW) across systems
+    LittlesLaw,
+    /// LLM: TTFT degradation with arrival rate
+    LlmTtft,
+    /// LLM: Effect of prompt length distribution on throughput
+    LlmPromptLength,
+    /// LLM: Batch size vs latency tradeoff under iteration-level policy
+    LlmBatchTradeoff,
+    /// Run all validations and demonstrations
     All,
 }
 
@@ -380,6 +388,202 @@ fn jackson_table() {
     println!("Traffic equations: λ_i = γ_i + Σ_j λ_j·R[j][i], solved by Gauss-Seidel.");
 }
 
+fn littles_law_validation() {
+    println!(
+        "\n── Operational Law: Little's Law (L = λ·T where T = response time) ────────────────"
+    );
+    println!(
+        "{:<15}  {:>6}  {:>10}  {:>10}  {:>10}  {:>6}",
+        "system", "λ", "E[N] obs", "λ·E[T]", "error%", "pass"
+    );
+    println!("{}", "-".repeat(70));
+
+    let mu = 1.0_f64;
+    let end_time = 500_000.0;
+
+    for &lambda in &[0.3_f64, 0.5, 0.7, 0.9] {
+        let mut sim = Simulation::with_seed(42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.run_until(end_time);
+
+        let l_obs = sim.mean_system_size();
+        let et_sim = sim.mean_response_time().unwrap_or(f64::NAN);
+        let lt_thy = lambda * et_sim;
+        let error = (l_obs - lt_thy).abs() / lt_thy * 100.0;
+        let pass = if error < 2.0 { "✓" } else { "✗" };
+
+        println!(
+            "{:<15}  {:>6.2}  {:>10.4}  {:>10.4}  {:>9.2}%  {:>6}",
+            format!("M/M/1 (ρ={:.2})", lambda / mu),
+            lambda,
+            l_obs,
+            lt_thy,
+            error,
+            pass
+        );
+    }
+
+    println!("\nLittle's Law: L = λ·T (mean system size = arrival rate × mean response time)");
+    println!("Holds for any queueing discipline and arrival/service distribution.");
+}
+
+fn llm_ttft_degradation() {
+    println!(
+        "\n── LLM: TTFT degradation as a function of arrival rate ──────────────────────────────"
+    );
+    println!(
+        "{:<13}  {:>5}  {:>8}  {:>8}  {:>10}",
+        "policy", "λ", "TTFT", "E2E", "throughput"
+    );
+    println!("{}", "-".repeat(50));
+
+    let hw = HardwareConfig::default();
+    let end_time = 100_000.0_f64;
+
+    for lambda in [0.2_f64, 0.5, 1.0, 2.0, 4.0, 8.0] {
+        for policy in [LlmPolicy::RequestLevel, LlmPolicy::IterationLevel] {
+            let mut sched = InferenceScheduler::new(
+                policy,
+                hw,
+                lambda,
+                Box::new(Pareto::with_mean(2.5, 64.0)),
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            let ttft = sched.mean_ttft().unwrap_or(f64::NAN);
+            let e2e = sched.mean_e2e().unwrap_or(f64::NAN);
+            let thr = sched.throughput();
+
+            if lambda == 0.2_f64 {
+                println!(
+                    "{:<13}  {:>5.1}  {:>8.3}  {:>8.3}  {:>10.3}",
+                    policy.to_string(),
+                    lambda,
+                    ttft,
+                    e2e,
+                    thr
+                );
+            } else {
+                println!(
+                    "{:<13}  {:>5.1}  {:>8.3}  {:>8.3}  {:>10.3}",
+                    "", lambda, ttft, e2e, thr
+                );
+            }
+        }
+        println!();
+    }
+    println!("TTFT = time-to-first-token; E2E = end-to-end latency; throughput = reqs/sec");
+    println!("Request-level: strict FCFS, next request waits for current to finish all output");
+    println!("Iteration-level: multiplex requests in decode batch, admit new requests each step");
+}
+
+fn llm_prompt_length_effect() {
+    println!(
+        "\n── LLM: Effect of prompt length distribution on throughput ────────────────────────────"
+    );
+    println!(
+        "{:<20}  {:>6}  {:>10}  {:>10}  {:>10}",
+        "prompt distribution", "λ", "throughput", "mean TTFT", "mean E2E"
+    );
+    println!("{}", "-".repeat(65));
+
+    let hw = HardwareConfig::default();
+    let end_time = 100_000.0;
+
+    for (dist_name, use_pareto) in [("Exponential(64)", false), ("Pareto(α=2.5)", true)] {
+        for lambda in [0.5_f64, 1.0, 2.0] {
+            let prompt_dist: Box<dyn Distribution> = if use_pareto {
+                Box::new(Pareto::with_mean(2.5, 64.0))
+            } else {
+                Box::new(Exponential::new(1.0 / 64.0))
+            };
+
+            let mut sched = InferenceScheduler::new(
+                LlmPolicy::IterationLevel,
+                hw,
+                lambda,
+                prompt_dist,
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            println!(
+                "{:<20}  {:>6.1}  {:>10.3}  {:>10.3}  {:>10.3}",
+                dist_name,
+                lambda,
+                sched.throughput(),
+                sched.mean_ttft().unwrap_or(f64::NAN),
+                sched.mean_e2e().unwrap_or(f64::NAN)
+            );
+        }
+    }
+
+    println!("\nExponential: light-tailed (most prompts are short), easier to batch");
+    println!("Pareto: heavy-tailed (mix of very short and very long), harder to batch");
+}
+
+fn llm_batch_latency_tradeoff() {
+    println!(
+        "\n── LLM: Batch size vs latency under iteration-level scheduling ────────────────────────"
+    );
+    println!(
+        "{:<12}  {:>5}  {:>8}  {:>8}  {:>10}  {:>12}",
+        "max batch", "λ", "TTFT", "E2E", "throughput", "avg batch"
+    );
+    println!("{}", "-".repeat(65));
+
+    let end_time = 100_000.0;
+
+    for max_batch in [1_usize, 4, 8, 16, 32] {
+        let hw = HardwareConfig {
+            max_batch_size: max_batch,
+            ..Default::default()
+        };
+
+        for lambda in [1.0_f64, 2.0, 4.0] {
+            let mut sched = InferenceScheduler::new(
+                LlmPolicy::IterationLevel,
+                hw,
+                lambda,
+                Box::new(Pareto::with_mean(2.5, 64.0)),
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            if lambda == 1.0 {
+                println!(
+                    "{:<12}  {:>5.1}  {:>8.3}  {:>8.3}  {:>10.3}  {:>12.2}",
+                    max_batch,
+                    lambda,
+                    sched.mean_ttft().unwrap_or(f64::NAN),
+                    sched.mean_e2e().unwrap_or(f64::NAN),
+                    sched.throughput(),
+                    sched.mean_batch_size()
+                );
+            } else {
+                println!(
+                    "{:<12}  {:>5.1}  {:>8.3}  {:>8.3}  {:>10.3}  {:>12.2}",
+                    "",
+                    lambda,
+                    sched.mean_ttft().unwrap_or(f64::NAN),
+                    sched.mean_e2e().unwrap_or(f64::NAN),
+                    sched.throughput(),
+                    sched.mean_batch_size()
+                );
+            }
+        }
+        println!();
+    }
+
+    println!("Larger batch size: better throughput, worse TTFT (longer queueing)");
+    println!("Smaller batch size: worse throughput (compute underutilized), better TTFT");
+}
+
 fn llm_table() {
     println!(
         "\n── LLM inference: request-level vs iteration-level (Orca) scheduling ───────────────"
@@ -437,6 +641,10 @@ fn main() {
         Some(Commands::MmkFinite) => mmk_finite_table(),
         Some(Commands::Jackson) => jackson_table(),
         Some(Commands::Llm) => llm_table(),
+        Some(Commands::LittlesLaw) => littles_law_validation(),
+        Some(Commands::LlmTtft) => llm_ttft_degradation(),
+        Some(Commands::LlmPromptLength) => llm_prompt_length_effect(),
+        Some(Commands::LlmBatchTradeoff) => llm_batch_latency_tradeoff(),
         Some(Commands::All) | None => {
             mm1_table();
             pk_table();
@@ -444,7 +652,11 @@ fn main() {
             mmk_table();
             mmk_finite_table();
             jackson_table();
+            littles_law_validation();
             llm_table();
+            llm_ttft_degradation();
+            llm_prompt_length_effect();
+            llm_batch_latency_tradeoff();
         }
     }
 }
