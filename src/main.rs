@@ -1,4 +1,5 @@
 mod calendar;
+mod charts;
 mod clock;
 mod distributions;
 mod llm;
@@ -180,12 +181,16 @@ fn srpt_table() {
     let alpha = 2.5_f64;
     let end_time = 500_000.0;
 
+    let mut fcfs_times = vec![];
+    let mut srpt_times = vec![];
+
     for lambda in [0.5_f64, 0.7, 0.8, 0.9] {
         let rho = lambda / mu;
         // P-K lower bound (FCFS with this distribution):
         let dist = Pareto::with_mean(alpha, 1.0 / mu);
         let pk = dist.mean() + lambda * dist.second_moment() / (2.0 * (1.0 - rho));
 
+        let mut fcfs_et = 0.0;
         for (label, policy) in [("FCFS", Policy::Fcfs), ("SRPT", Policy::Srpt)] {
             let mut sim = Simulation::with_seed(42);
             sim.start_arrivals(lambda);
@@ -196,19 +201,24 @@ fn srpt_table() {
             let et = sim.mean_response_time().unwrap_or(f64::NAN);
             let en = sim.mean_system_size();
             if label == "FCFS" {
+                fcfs_et = et;
+                fcfs_times.push((format!("{:.2}", rho), et));
                 println!(
                     "{:<6.2}  {:<6}  {:>10.3}  {:>10.3}  {:>10.3}",
                     rho, label, et, en, pk
                 );
             } else {
+                srpt_times.push((format!("{:.2}", rho), et));
+                let speedup = fcfs_et / et;
                 println!(
-                    "{:<6.2}  {:<6}  {:>10.3}  {:>10.3}  {:>10}",
-                    rho, label, et, en, ""
+                    "{:<6.2}  {:<6}  {:>10.3}  {:>10.3}  {:>10.3}x",
+                    rho, label, et, en, speedup
                 );
             }
         }
         println!();
     }
+
     println!("P-K is E[T] for FCFS (= minimum over work-conserving non-preemptive policies).");
     println!("SRPT minimizes E[T] among all preemptive policies; gap widens with heavier load.");
 }
@@ -381,8 +391,6 @@ fn llm_table() {
     println!("{}", "-".repeat(62));
 
     let hw = HardwareConfig::default();
-    // Prompt lengths: Pareto(α=2.5, mean≈64 tokens) — heavy-tailed, realistic.
-    // Output lengths: Exponential(mean=64 tokens).
     let end_time = 100_000.0_f64;
 
     for lambda in [0.5_f64, 1.0, 2.0, 4.0] {
