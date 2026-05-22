@@ -1,4 +1,4 @@
-//! Jackson open queueing network.
+//! Open Jackson queueing network.
 //!
 //! Each node is an independent M/M/1 queue. External Poisson arrivals feed the
 //! network; at departure a job routes to another node with probabilities given by
@@ -16,8 +16,6 @@ use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use crate::clock::SimClock;
 use crate::distributions::{Distribution, Exponential};
 
-// ── Events ──────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 enum NetEvent {
     Arrival { node: usize, job_id: u64 },
@@ -30,14 +28,11 @@ struct TimedEvent {
     kind: NetEvent,
 }
 
-// ── Node ────────────────────────────────────────────────────────────────────
-
 #[derive(Debug)]
 struct Node {
     service_dist: Box<dyn Distribution>,
     queue: VecDeque<u64>,
     busy: bool,
-    // stats
     system_size: u64,
     area_n: f64,
     last_event_time: f64,
@@ -59,23 +54,19 @@ impl Node {
         if now <= 0.0 {
             return 0.0;
         }
-        // Include time since last event for jobs still in system
         (self.area_n + self.system_size as f64 * (now - self.last_event_time)) / now
     }
 }
 
-// ── Network ──────────────────────────────────────────────────────────────────
-
-/// Open Jackson network.
+/// Open Jackson network: a directed graph of M/M/1 nodes with probabilistic routing.
 pub struct JacksonNetwork {
     pub clock: SimClock,
     nodes: Vec<Node>,
     /// routing[i][j] = probability job routes from node i to node j; row sum ≤ 1.
     routing: Vec<Vec<f64>>,
-    /// external_rates[i] = external Poisson arrival rate to node i.
     external_rates: Vec<f64>,
     arrival_dists: Vec<Option<Exponential>>,
-    calendar: Vec<TimedEvent>, // simple sorted vec (small networks)
+    calendar: Vec<TimedEvent>,
     rng: SmallRng,
     next_job_id: u64,
     arrival_times: HashMap<u64, f64>,
@@ -94,9 +85,10 @@ impl std::fmt::Debug for JacksonNetwork {
 
 impl JacksonNetwork {
     /// Build a network with `n` nodes.
-    /// `service_dists`: one distribution per node.
-    /// `routing`: n×n matrix; routing[i][j] = p(i→j), row sum ≤ 1.
-    /// `external_rates`: Poisson rate of external arrivals at each node.
+    ///
+    /// - `service_dists`: one distribution per node.
+    /// - `routing`: n×n matrix; `routing[i][j]` = p(i→j), row sum ≤ 1.
+    /// - `external_rates`: Poisson rate of external arrivals at each node.
     pub fn new(
         service_dists: Vec<Box<dyn Distribution>>,
         routing: Vec<Vec<f64>>,
@@ -136,7 +128,6 @@ impl JacksonNetwork {
         net
     }
 
-    /// Run until simulated time reaches `end_time`.
     pub fn run_until(&mut self, end_time: f64) {
         loop {
             let next_idx = self
@@ -155,17 +146,17 @@ impl JacksonNetwork {
         }
     }
 
-    /// Mean system size at node `i` (time-averaged).
+    /// Time-averaged mean number of jobs at node `i`.
     pub fn mean_system_size(&self, node: usize) -> f64 {
         self.nodes[node].mean_system_size(self.clock.time)
     }
 
-    /// Mean response time across all jobs that exited the network.
+    /// Mean end-to-end sojourn time across all jobs that exited the network.
     pub fn mean_sojourn(&self) -> Option<f64> {
         (self.jobs_completed > 0).then(|| self.total_sojourn / self.jobs_completed as f64)
     }
 
-    /// Solve the traffic equations λ_i = γ_i + Σ_j λ_j·R[j][i] by Gauss-Seidel iteration.
+    /// Solve the traffic equations λ_i = γ_i + Σ_j λ_j·R[j][i] by Gauss-Seidel.
     pub fn effective_arrival_rates(&self) -> Vec<f64> {
         let n = self.nodes.len();
         let mut lam = self.external_rates.clone();
@@ -186,8 +177,6 @@ impl JacksonNetwork {
         }
         lam
     }
-
-    // ── internals ────────────────────────────────────────────────────────────
 
     fn push_event(&mut self, time: f64, kind: NetEvent) {
         self.calendar.push(TimedEvent { time, kind });
@@ -226,7 +215,6 @@ impl JacksonNetwork {
     fn on_arrival(&mut self, node: usize, job_id: u64) {
         self.update_node_stats(node);
         self.nodes[node].system_size += 1;
-        // Record network entry time on first arrival at any node
         self.arrival_times.entry(job_id).or_insert(self.clock.time);
 
         if !self.nodes[node].busy {
@@ -243,14 +231,12 @@ impl JacksonNetwork {
         self.nodes[node].system_size -= 1;
         self.nodes[node].busy = false;
 
-        // Route to next node or exit
         let u: f64 = self.rng.random();
         let mut cum = 0.0;
         let mut routed = false;
         for (j, &p) in self.routing[node].iter().enumerate() {
             cum += p;
             if u < cum {
-                // Route to node j
                 let next_node = j;
                 self.update_node_stats(next_node);
                 self.nodes[next_node].system_size += 1;
@@ -265,15 +251,11 @@ impl JacksonNetwork {
             }
         }
 
-        if !routed {
-            // Job exits network
-            if let Some(t_enter) = self.arrival_times.remove(&job_id) {
-                self.total_sojourn += self.clock.time - t_enter;
-                self.jobs_completed += 1;
-            }
+        if !routed && let Some(t_enter) = self.arrival_times.remove(&job_id) {
+            self.total_sojourn += self.clock.time - t_enter;
+            self.jobs_completed += 1;
         }
 
-        // Start next job at this node if any
         if let Some(next_job) = self.nodes[node].queue.pop_front() {
             self.nodes[node].busy = true;
             self.schedule_departure(node, next_job);

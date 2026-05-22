@@ -1,3 +1,4 @@
+/// Monotonically-advancing simulation clock.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SimClock {
     pub time: f64,
@@ -8,6 +9,7 @@ impl SimClock {
         Self::default()
     }
 
+    /// Advance to `t`. Panics if `t < self.time` (causality violation).
     pub fn advance_to(&mut self, t: f64) {
         assert!(
             t >= self.time,
@@ -27,7 +29,7 @@ mod tests {
     fn advances_forward() {
         let mut clock = SimClock::new();
         clock.advance_to(1.0);
-        clock.advance_to(1.0); // same timestamp is fine (tie)
+        clock.advance_to(1.0);
         clock.advance_to(5.0);
         assert_eq!(clock.time, 5.0);
     }

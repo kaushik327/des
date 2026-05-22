@@ -1,5 +1,7 @@
+//! Online statistics: running mean/variance and empirical tail probabilities.
+
 /// Welford's online algorithm for running mean and sample variance.
-/// Single-pass, numerically stable. Use `update` after each observation.
+/// Single-pass, numerically stable. Call `update` after each observation.
 #[derive(Debug, Default, Clone)]
 pub struct Welford {
     count: u64,
@@ -19,11 +21,6 @@ impl Welford {
         self.m2 += delta * (x - self.mean);
     }
 
-    #[allow(dead_code)]
-    pub fn count(&self) -> u64 {
-        self.count
-    }
-
     pub fn mean(&self) -> Option<f64> {
         (self.count > 0).then_some(self.mean)
     }
@@ -38,8 +35,8 @@ impl Welford {
     }
 }
 
-/// Collects individual observations for empirical tail statistics.
-/// Call `finish` once to sort; then query `tail_prob` or `percentile`.
+/// Collects samples for empirical tail statistics.
+/// Call `finish` once to sort, then query `tail_prob`.
 #[derive(Debug, Default, Clone)]
 pub struct EmpiricalCdf {
     samples: Vec<f64>,
@@ -56,23 +53,12 @@ impl EmpiricalCdf {
         self.sorted = false;
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
-    }
-
-    /// Sort the collected samples so that `tail_prob` and `percentile` are valid.
     pub fn finish(&mut self) {
         self.samples.sort_by(f64::total_cmp);
         self.sorted = true;
     }
 
-    /// P{X > threshold} — requires `finish` to have been called.
+    /// P{X > threshold}. Requires `finish` to have been called.
     pub fn tail_prob(&self, threshold: f64) -> f64 {
         debug_assert!(self.sorted, "call finish() before querying tail_prob");
         let n = self.samples.len();
@@ -94,10 +80,8 @@ mod tests {
         for x in [2.0_f64, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             w.update(x);
         }
-        let mean = w.mean().unwrap();
-        let var = w.variance().unwrap();
-        assert!((mean - 5.0).abs() < 1e-10, "mean {mean}");
-        assert!((var - 4.571_428).abs() < 1e-5, "variance {var}");
+        assert!((w.mean().unwrap() - 5.0).abs() < 1e-10);
+        assert!((w.variance().unwrap() - 4.571_428).abs() < 1e-5);
     }
 
     #[test]
@@ -115,8 +99,7 @@ mod tests {
             cdf.push(x);
         }
         cdf.finish();
-        let p = cdf.tail_prob(3.0);
-        // 4 and 5 exceed 3.0, so P{X > 3} = 2/5 = 0.4
-        assert!((p - 0.4).abs() < 1e-10, "tail prob {p}");
+        // 4 and 5 exceed 3.0, so P{X > 3} = 2/5
+        assert!((cdf.tail_prob(3.0) - 0.4).abs() < 1e-10);
     }
 }

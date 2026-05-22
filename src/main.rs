@@ -1,7 +1,6 @@
 mod calendar;
 mod clock;
 mod distributions;
-mod event;
 mod network;
 mod queue;
 mod server;

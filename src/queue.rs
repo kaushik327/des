@@ -1,33 +1,22 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
-// ── FCFS ───────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Default)]
-pub struct FcfsQueue {
-    inner: VecDeque<(u64, f64)>, // (job_id, remaining_when_queued)
+pub(crate) struct FcfsQueue {
+    inner: VecDeque<(u64, f64)>,
 }
 
 impl FcfsQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn push(&mut self, job_id: u64, remaining: f64) {
+    fn push(&mut self, job_id: u64, remaining: f64) {
         self.inner.push_back((job_id, remaining));
     }
-    pub fn pop(&mut self) -> Option<(u64, f64)> {
+    fn pop(&mut self) -> Option<(u64, f64)> {
         self.inner.pop_front()
     }
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.len()
     }
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
 }
-
-// ── SRPT ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 struct SrptEntry {
@@ -48,7 +37,6 @@ impl PartialOrd for SrptEntry {
 }
 impl Ord for SrptEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // For BinaryHeap (max-heap) + Reverse: we want min by remaining.
         self.remaining
             .total_cmp(&other.remaining)
             .then(self.job_id.cmp(&other.job_id))
@@ -56,34 +44,26 @@ impl Ord for SrptEntry {
 }
 
 #[derive(Debug, Default)]
-pub struct SrptQueue {
+pub(crate) struct SrptQueue {
     heap: BinaryHeap<std::cmp::Reverse<SrptEntry>>,
 }
 
 impl SrptQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn push(&mut self, job_id: u64, remaining: f64) {
+    fn push(&mut self, job_id: u64, remaining: f64) {
         self.heap
             .push(std::cmp::Reverse(SrptEntry { remaining, job_id }));
     }
-    pub fn pop(&mut self) -> Option<(u64, f64)> {
+    fn pop(&mut self) -> Option<(u64, f64)> {
         self.heap
             .pop()
             .map(|std::cmp::Reverse(e)| (e.job_id, e.remaining))
     }
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.heap.len()
-    }
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
     }
 }
 
-// ── Unified ────────────────────────────────────────────────────────────────
-
+/// Scheduling discipline for the waiting queue.
 #[derive(Debug)]
 pub enum SimQueue {
     Fcfs(FcfsQueue),
@@ -92,10 +72,10 @@ pub enum SimQueue {
 
 impl SimQueue {
     pub fn fcfs() -> Self {
-        SimQueue::Fcfs(FcfsQueue::new())
+        SimQueue::Fcfs(FcfsQueue::default())
     }
     pub fn srpt() -> Self {
-        SimQueue::Srpt(SrptQueue::new())
+        SimQueue::Srpt(SrptQueue::default())
     }
 
     pub fn push(&mut self, job_id: u64, remaining: f64) {
@@ -116,14 +96,6 @@ impl SimQueue {
         match self {
             SimQueue::Fcfs(q) => q.len(),
             SimQueue::Srpt(q) => q.len(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        match self {
-            SimQueue::Fcfs(q) => q.is_empty(),
-            SimQueue::Srpt(q) => q.is_empty(),
         }
     }
 }

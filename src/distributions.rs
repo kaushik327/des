@@ -1,12 +1,15 @@
+//! Probability distributions for simulation workloads.
+//!
+//! All distributions implement [`Distribution`], which is object-safe so they can
+//! be stored as `Box<dyn Distribution>` for runtime dispatch.
+
 use rand::Rng;
 
-/// Draw a uniform float in [0, 1) from any Rng, using 53 bits of entropy.
 fn uniform(rng: &mut dyn Rng) -> f64 {
     (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
-/// A probability distribution that can produce samples and report its moments.
-/// Object-safe: `Box<dyn Distribution>` works for runtime dispatch.
+/// A probability distribution that produces samples and reports its moments.
 pub trait Distribution: std::fmt::Debug {
     fn sample(&self, rng: &mut dyn Rng) -> f64;
     fn mean(&self) -> f64;
@@ -17,8 +20,6 @@ pub trait Distribution: std::fmt::Debug {
         self.variance() + self.mean() * self.mean()
     }
 }
-
-// ── Exponential ────────────────────────────────────────────────────────────
 
 /// Exponential(λ): interarrival times for a Poisson process, M/M/1 service times.
 #[derive(Debug, Clone, Copy)]
@@ -48,10 +49,8 @@ impl Distribution for Exponential {
     }
 }
 
-// ── Erlang ─────────────────────────────────────────────────────────────────
-
 /// Erlang(k, rate): sum of k independent Exponential(rate) phases.
-/// CV² = 1/k < 1 — less variable than exponential.
+/// CV² = 1/k — less variable than exponential.
 #[derive(Debug, Clone, Copy)]
 pub struct Erlang {
     k: u32,
@@ -86,10 +85,8 @@ impl Distribution for Erlang {
     }
 }
 
-// ── Hyperexponential ───────────────────────────────────────────────────────
-
 /// Hyperexponential: with probability p sample Exp(lambda1), else Exp(lambda2).
-/// CV² > 1 — more variable than exponential; models heavy-tailed workloads.
+/// CV² > 1 — more variable than exponential.
 #[derive(Debug, Clone, Copy)]
 pub struct Hyperexponential {
     p: f64,
@@ -109,19 +106,17 @@ impl Hyperexponential {
         }
     }
 
-    /// Build a balanced hyperexponential with mean=1/mu and the requested CV².
-    /// Uses p=0.1 and solves the two-moment constraint equations analytically.
+    /// Balanced hyperexponential with mean 1/mu and the given CV².
+    /// Uses p=0.1 and solves the two-moment constraints analytically.
     pub fn balanced(mu: f64, cv_sq: f64) -> Self {
         assert!(
             cv_sq > 1.0,
             "hyperexponential requires CV² > 1, got {cv_sq}"
         );
         let p = 0.1_f64;
-        // With p=0.1, E[S]=1/mu, and Var[S]=cv_sq/mu², the constraint equations reduce to
-        // 18c² - 36c + (19 - cv_sq) = 0 where c = mu/lambda2.
-        // disc = 36² - 4·18·(19-cv_sq) = 72·(cv_sq-1)
+        // Quadratic 18c² - 36c + (19 - cv_sq) = 0; discriminant = 72·(cv_sq-1).
         let disc = (72.0 * (cv_sq - 1.0)).sqrt();
-        let c = (36.0 - disc) / 36.0; // smaller root keeps lambda1 positive
+        let c = (36.0 - disc) / 36.0;
         let mean2 = c / mu;
         let mean1 = (1.0 / mu - (1.0 - p) * mean2) / p;
         Self::new(p, 1.0 / mean1, 1.0 / mean2)
@@ -150,11 +145,10 @@ impl Distribution for Hyperexponential {
     }
 }
 
-// ── Pareto ─────────────────────────────────────────────────────────────────
-
 /// Pareto(α, x_min): heavy-tailed distribution for real-world service times.
-/// Inverse CDF: x = x_min · (1−U)^{−1/α}
-/// E[X] = α·x_min/(α−1) for α > 1; Var[X] finite only for α > 2.
+///
+/// E[X] = α·x_min/(α−1) for α > 1; Var[X] is finite only for α > 2.
+/// Inverse CDF: x = x_min · (1−U)^{−1/α}.
 #[derive(Debug, Clone, Copy)]
 pub struct Pareto {
     alpha: f64,
@@ -203,7 +197,7 @@ mod tests {
     use rand::{SeedableRng, rngs::SmallRng};
 
     const N: usize = 200_000;
-    const TOL: f64 = 0.01; // 1 %
+    const TOL: f64 = 0.01;
 
     fn sample_stats(dist: &dyn Distribution, rng: &mut SmallRng) -> (f64, f64) {
         let mut mean = 0.0_f64;
@@ -222,8 +216,7 @@ mod tests {
         let dist = Exponential::new(3.0);
         let mut rng = SmallRng::seed_from_u64(1);
         let (mean, _) = sample_stats(&dist, &mut rng);
-        let err = (mean - dist.mean()).abs() / dist.mean();
-        assert!(err < TOL, "mean relative error {err:.4} > {TOL}");
+        assert!((mean - dist.mean()).abs() / dist.mean() < TOL);
     }
 
     #[test]
@@ -231,8 +224,7 @@ mod tests {
         let dist = Exponential::new(3.0);
         let mut rng = SmallRng::seed_from_u64(2);
         let (_, var) = sample_stats(&dist, &mut rng);
-        let err = (var - dist.variance()).abs() / dist.variance();
-        assert!(err < TOL, "variance relative error {err:.4} > {TOL}");
+        assert!((var - dist.variance()).abs() / dist.variance() < TOL);
     }
 
     #[test]
@@ -243,13 +235,11 @@ mod tests {
 
     #[test]
     fn erlang_mean_and_variance() {
-        let dist = Erlang::new(4, 2.0); // mean=2, var=1
+        let dist = Erlang::new(4, 2.0);
         let mut rng = SmallRng::seed_from_u64(3);
         let (mean, var) = sample_stats(&dist, &mut rng);
-        let merr = (mean - dist.mean()).abs() / dist.mean();
-        let verr = (var - dist.variance()).abs() / dist.variance();
-        assert!(merr < TOL, "Erlang mean error {merr:.4}");
-        assert!(verr < TOL, "Erlang variance error {verr:.4}");
+        assert!((mean - dist.mean()).abs() / dist.mean() < TOL);
+        assert!((var - dist.variance()).abs() / dist.variance() < TOL);
     }
 
     #[test]
@@ -257,18 +247,15 @@ mod tests {
         let dist = Hyperexponential::balanced(1.0, 5.0);
         let mut rng = SmallRng::seed_from_u64(4);
         let (mean, var) = sample_stats(&dist, &mut rng);
-        let merr = (mean - dist.mean()).abs() / dist.mean();
-        let verr = (var - dist.variance()).abs() / dist.variance();
-        assert!(merr < TOL, "Hyperexp mean error {merr:.4}");
-        assert!(verr < 0.05, "Hyperexp variance error {verr:.4}");
+        assert!((mean - dist.mean()).abs() / dist.mean() < TOL);
+        assert!((var - dist.variance()).abs() / dist.variance() < 0.05);
     }
 
     #[test]
     fn pareto_mean() {
-        let dist = Pareto::with_mean(3.0, 2.0); // alpha=3, mean=2
+        let dist = Pareto::with_mean(3.0, 2.0);
         let mut rng = SmallRng::seed_from_u64(5);
         let (mean, _) = sample_stats(&dist, &mut rng);
-        let err = (mean - dist.mean()).abs() / dist.mean();
-        assert!(err < TOL, "Pareto mean error {err:.4}");
+        assert!((mean - dist.mean()).abs() / dist.mean() < TOL);
     }
 }

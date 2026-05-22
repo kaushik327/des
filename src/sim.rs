@@ -2,10 +2,9 @@ use std::collections::HashMap;
 
 use rand::{SeedableRng, rngs::SmallRng};
 
-use crate::calendar::EventCalendar;
+use crate::calendar::{Event, EventCalendar, EventKind};
 use crate::clock::SimClock;
 use crate::distributions::{Distribution, Exponential};
-use crate::event::{Event, EventKind};
 use crate::queue::SimQueue;
 use crate::server::Server;
 use crate::stats::{EmpiricalCdf, Welford};
@@ -17,11 +16,17 @@ pub enum Policy {
     Srpt,
 }
 
+/// M/G/1-family single-node simulator.
+///
+/// Supports multiple servers (M/M/k), finite buffers (M/M/1/K), FCFS and SRPT
+/// scheduling, and optional warmup discard. Build up configuration with the
+/// `start_*` / `set_*` methods, then call `run_until`.
 #[derive(Debug)]
 pub struct Simulation {
     pub clock: SimClock,
     pub arrivals_processed: u64,
     pub drops: u64,
+    pub waits: u64,
     calendar: EventCalendar,
     rng: SmallRng,
     arrival_dist: Option<Exponential>,
@@ -29,8 +34,7 @@ pub struct Simulation {
     policy: Policy,
     servers: Vec<Server>,
     queue: SimQueue,
-    capacity: Option<usize>, // finite buffer (None = ∞)
-    pub waits: u64,          // jobs that had to queue (not served immediately)
+    capacity: Option<usize>,
     job_remaining: HashMap<u64, f64>,
     arrival_times: HashMap<u64, f64>,
     response_time: Welford,
@@ -70,7 +74,7 @@ impl Simulation {
             arrival_dist: None,
             service_dist: None,
             policy: Policy::Fcfs,
-            servers: (0..k).map(Server::new).collect(),
+            servers: (0..k).map(|_| Server::new()).collect(),
             queue: SimQueue::fcfs(),
             capacity: None,
             job_remaining: HashMap::new(),
@@ -84,11 +88,6 @@ impl Simulation {
             warmup_until: 0.0,
             next_job_id: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn num_servers(&self) -> usize {
-        self.servers.len()
     }
 
     pub fn start_arrivals(&mut self, lambda: f64) {
@@ -108,29 +107,25 @@ impl Simulation {
         };
     }
 
-    #[allow(dead_code)]
     pub fn set_capacity(&mut self, cap: usize) {
         self.capacity = Some(cap);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_warmup(&mut self, until: f64) {
-        self.warmup_until = until;
     }
 
     pub fn mean_response_time(&self) -> Option<f64> {
         self.response_time.mean()
     }
+
     pub fn response_time_std_dev(&self) -> Option<f64> {
         self.response_time.std_dev()
     }
 
+    /// Time-averaged mean number of jobs in the system (post-warmup).
     pub fn mean_system_size(&self) -> f64 {
         let post = self.clock.time - self.warmup_until;
         if post <= 0.0 { 0.0 } else { self.area_n / post }
     }
 
-    /// Fraction of capacity used (busy_servers / k), equals ρ = λ/(k·μ) in steady state.
+    /// Fraction of server capacity in use: busy_servers / k, equal to ρ = λ/(k·μ) in steady state.
     pub fn server_utilization(&self) -> f64 {
         let post = self.clock.time - self.warmup_until;
         if post <= 0.0 {
@@ -145,11 +140,6 @@ impl Simulation {
         self.response_time_cdf.tail_prob(threshold)
     }
 
-    #[allow(dead_code)]
-    pub fn schedule(&mut self, event: Event) {
-        self.calendar.push(event);
-    }
-
     pub fn run_until(&mut self, end_time: f64) {
         while let Some(event) = self.calendar.pop_next() {
             if event.timestamp > end_time {
@@ -160,8 +150,6 @@ impl Simulation {
             self.dispatch(event);
         }
     }
-
-    // ── internals ──────────────────────────────────────────────────────────
 
     fn update_time_stats(&mut self) {
         let t_from = self.last_event_time.max(self.warmup_until);
@@ -225,7 +213,7 @@ impl Simulation {
                 if self.servers[server_id].is_current_epoch(epoch) {
                     self.on_departure(job_id, server_id);
                 }
-                // else: stale event from a preempted job — discard silently
+                // Stale event from a preempted job — discard silently.
             }
         }
     }
@@ -233,7 +221,6 @@ impl Simulation {
     fn on_arrival(&mut self, job_id: u64) {
         self.update_time_stats();
 
-        // Finite-buffer drop check (before incrementing system_size)
         if let Some(cap) = self.capacity
             && self.queue.len() >= cap
         {
@@ -246,9 +233,6 @@ impl Simulation {
         self.arrivals_processed += 1;
         self.arrival_times.insert(job_id, self.clock.time);
 
-        // Sample service time. For SRPT this must happen at arrival so we know
-        // the job size for preemption decisions. For FCFS it happens here too
-        // (sampling at arrival vs. service-start is equivalent in distribution).
         if let Some(size) = self.sample_service_time() {
             self.job_remaining.insert(job_id, size);
         }
@@ -257,7 +241,6 @@ impl Simulation {
         if any_idle {
             self.begin_service(job_id);
         } else if self.policy == Policy::Srpt && self.servers.len() == 1 {
-            // Single-server SRPT preemption
             let new_remaining = self
                 .job_remaining
                 .get(&job_id)
@@ -304,10 +287,17 @@ impl Simulation {
 }
 
 #[cfg(test)]
+impl Simulation {
+    pub fn schedule(&mut self, event: Event) {
+        self.calendar.push(event);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calendar::EventKind;
     use crate::distributions::Exponential;
-    use crate::event::EventKind;
 
     fn arrival(t: f64, id: u64) -> Event {
         Event::new(t, EventKind::Arrival { job_id: id })
@@ -362,7 +352,7 @@ mod tests {
         let err = (empirical_rate - lambda).abs() / lambda;
         assert!(
             err < 0.01,
-            "rate error {err:.4} > 0.01 (got {empirical_rate:.4}, expected {lambda})"
+            "rate error {err:.4} (got {empirical_rate:.4}, expected {lambda})"
         );
     }
 

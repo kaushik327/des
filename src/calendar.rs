@@ -1,8 +1,56 @@
-use std::cmp::Reverse;
+//! Event calendar: the sorted priority queue at the heart of the DES engine.
+
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-use crate::event::Event;
+#[derive(Debug, Clone)]
+pub enum EventKind {
+    Arrival {
+        job_id: u64,
+    },
+    Departure {
+        job_id: u64,
+        server_id: usize,
+        epoch: u64,
+    },
+}
 
+/// A timestamped event in the simulation.
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub timestamp: f64,
+    pub kind: EventKind,
+}
+
+impl Event {
+    pub fn new(timestamp: f64, kind: EventKind) -> Self {
+        Self { timestamp, kind }
+    }
+}
+
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+    }
+}
+impl Eq for Event {}
+
+impl PartialOrd for Event {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Timestamps are always finite in a valid simulation.
+impl Ord for Event {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .partial_cmp(&other.timestamp)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+/// Min-heap of future events ordered by timestamp.
 #[derive(Debug, Default)]
 pub struct EventCalendar {
     heap: BinaryHeap<Reverse<Event>>,
@@ -17,25 +65,15 @@ impl EventCalendar {
         self.heap.push(Reverse(event));
     }
 
+    /// Removes and returns the earliest event, or `None` if the calendar is empty.
     pub fn pop_next(&mut self) -> Option<Event> {
         self.heap.pop().map(|Reverse(e)| e)
-    }
-
-    #[allow(dead_code)] // needed for finite-buffer drop logic and stats collection
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-
-    #[allow(dead_code)] // needed for finite-buffer drop logic and stats collection
-    pub fn len(&self) -> usize {
-        self.heap.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventKind;
 
     fn arrival(t: f64, id: u64) -> Event {
         Event::new(t, EventKind::Arrival { job_id: id })
@@ -47,7 +85,6 @@ mod tests {
         cal.push(arrival(3.0, 3));
         cal.push(arrival(1.0, 1));
         cal.push(arrival(2.0, 2));
-
         assert_eq!(cal.pop_next().unwrap().timestamp, 1.0);
         assert_eq!(cal.pop_next().unwrap().timestamp, 2.0);
         assert_eq!(cal.pop_next().unwrap().timestamp, 3.0);
@@ -65,7 +102,6 @@ mod tests {
         let mut cal = EventCalendar::new();
         cal.push(arrival(1.0, 1));
         cal.push(arrival(1.0, 2));
-        // Both should pop without panicking; order between ties is unspecified.
         assert_eq!(cal.pop_next().unwrap().timestamp, 1.0);
         assert_eq!(cal.pop_next().unwrap().timestamp, 1.0);
     }
