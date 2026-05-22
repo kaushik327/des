@@ -11,17 +11,14 @@
 //! Hardware parameters are stylized rather than tied to a specific GPU; results
 //! should be read as relative comparisons between policies.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 
 use rand::{SeedableRng, rngs::SmallRng};
 
-use crate::calendar::EventCalendar;
+use crate::calendar::{Event, EventCalendar};
 use crate::clock::SimClock;
 use crate::distributions::{Distribution, Exponential};
 use crate::stats::Welford;
-
-// ── Events ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 enum LlmEventKind {
@@ -33,39 +30,6 @@ enum LlmEventKind {
     DecodeStep,
 }
 
-#[derive(Debug, Clone)]
-struct LlmEvent {
-    timestamp: f64,
-    kind: LlmEventKind,
-}
-
-impl LlmEvent {
-    fn new(timestamp: f64, kind: LlmEventKind) -> Self {
-        Self { timestamp, kind }
-    }
-}
-
-impl PartialEq for LlmEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp == other.timestamp
-    }
-}
-impl Eq for LlmEvent {}
-impl PartialOrd for LlmEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for LlmEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.timestamp
-            .partial_cmp(&other.timestamp)
-            .unwrap_or(Ordering::Equal)
-    }
-}
-
-// ── Request ───────────────────────────────────────────────────────────────────
-
 struct Request {
     arrival_time: f64,
     prompt_len: usize,
@@ -75,8 +39,6 @@ struct Request {
     kv_slots: usize,
     first_token_time: Option<f64>,
 }
-
-// ── Public configuration ──────────────────────────────────────────────────────
 
 /// Stylized GPU hardware parameters.
 #[derive(Debug, Clone, Copy)]
@@ -123,8 +85,6 @@ impl std::fmt::Display for LlmPolicy {
     }
 }
 
-// ── Scheduler ────────────────────────────────────────────────────────────────
-
 /// LLM inference scheduler simulator.
 ///
 /// Arrival → prefill queue → prefill (single-threaded) → KV-wait queue →
@@ -135,7 +95,7 @@ pub struct InferenceScheduler {
     hw: HardwareConfig,
     policy: LlmPolicy,
 
-    calendar: EventCalendar<LlmEvent>,
+    calendar: EventCalendar<Event<LlmEventKind>>,
     requests: HashMap<u64, Request>,
     next_req_id: u64,
 
@@ -269,7 +229,7 @@ impl InferenceScheduler {
         let dt = self.arrival_dist.sample(&mut self.rng);
         let req_id = self.next_req_id;
         self.next_req_id += 1;
-        self.calendar.push(LlmEvent::new(
+        self.calendar.push(Event::new(
             self.clock.time + dt,
             LlmEventKind::Arrival { req_id },
         ));
@@ -283,7 +243,7 @@ impl InferenceScheduler {
             let prompt_len = self.requests[&req_id].prompt_len;
             let done_at = self.clock.time + prompt_len as f64 * self.hw.t_prefill_per_token;
             self.being_prefilled = Some(req_id);
-            self.calendar.push(LlmEvent::new(
+            self.calendar.push(Event::new(
                 done_at,
                 LlmEventKind::PrefillComplete { req_id },
             ));
@@ -334,8 +294,7 @@ impl InferenceScheduler {
     fn ensure_decode_scheduled(&mut self) {
         if !self.decode_batch.is_empty() && !self.decode_step_scheduled {
             let t = self.clock.time + self.decode_step_time();
-            self.calendar
-                .push(LlmEvent::new(t, LlmEventKind::DecodeStep));
+            self.calendar.push(Event::new(t, LlmEventKind::DecodeStep));
             self.decode_step_scheduled = true;
         }
     }

@@ -27,7 +27,7 @@ pub struct Simulation {
     pub arrivals_processed: u64,
     pub drops: u64,
     pub waits: u64,
-    calendar: EventCalendar<Event>,
+    calendar: EventCalendar<Event<EventKind>>,
     rng: SmallRng,
     arrival_dist: Option<Exponential>,
     service_dist: Option<Box<dyn Distribution>>,
@@ -202,7 +202,7 @@ impl Simulation {
         }
     }
 
-    fn dispatch(&mut self, event: Event) {
+    fn dispatch(&mut self, event: Event<EventKind>) {
         match event.kind {
             EventKind::Arrival { job_id } => self.on_arrival(job_id),
             EventKind::Departure {
@@ -288,7 +288,7 @@ impl Simulation {
 
 #[cfg(test)]
 impl Simulation {
-    pub fn schedule(&mut self, event: Event) {
+    pub fn schedule(&mut self, event: Event<EventKind>) {
         self.calendar.push(event);
     }
 }
@@ -299,11 +299,11 @@ mod tests {
     use crate::calendar::EventKind;
     use crate::distributions::Exponential;
 
-    fn arrival(t: f64, id: u64) -> Event {
+    fn arrival(t: f64, id: u64) -> Event<EventKind> {
         Event::new(t, EventKind::Arrival { job_id: id })
     }
 
-    fn departure(t: f64, job: u64, server: usize) -> Event {
+    fn departure(t: f64, job: u64, server: usize) -> Event<EventKind> {
         Event::new(
             t,
             EventKind::Departure {

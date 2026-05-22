@@ -17,34 +17,37 @@ pub enum EventKind {
     },
 }
 
-/// A timestamped event in the simulation.
+/// A timestamped event carrying a domain-specific kind `K`.
+///
+/// Ordering is by timestamp only, so any `K` can be used — including the
+/// queueing-sim [`EventKind`] and the LLM scheduler's own kind type.
 #[derive(Debug, Clone)]
-pub struct Event {
+pub struct Event<K> {
     pub timestamp: f64,
-    pub kind: EventKind,
+    pub kind: K,
 }
 
-impl Event {
-    pub fn new(timestamp: f64, kind: EventKind) -> Self {
+impl<K> Event<K> {
+    pub fn new(timestamp: f64, kind: K) -> Self {
         Self { timestamp, kind }
     }
 }
 
-impl PartialEq for Event {
+impl<K> PartialEq for Event<K> {
     fn eq(&self, other: &Self) -> bool {
         self.timestamp == other.timestamp
     }
 }
-impl Eq for Event {}
+impl<K> Eq for Event<K> {}
 
-impl PartialOrd for Event {
+impl<K> PartialOrd for Event<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 // Timestamps are always finite in a valid simulation.
-impl Ord for Event {
+impl<K> Ord for Event<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.timestamp
             .partial_cmp(&other.timestamp)
@@ -91,7 +94,7 @@ impl<E: Ord> EventCalendar<E> {
 mod tests {
     use super::*;
 
-    fn arrival(t: f64, id: u64) -> Event {
+    fn arrival(t: f64, id: u64) -> Event<EventKind> {
         Event::new(t, EventKind::Arrival { job_id: id })
     }
 
@@ -109,7 +112,7 @@ mod tests {
 
     #[test]
     fn empty_calendar_returns_none() {
-        let mut cal: EventCalendar<Event> = EventCalendar::new();
+        let mut cal: EventCalendar<Event<EventKind>> = EventCalendar::new();
         assert!(cal.pop_next().is_none());
     }
 
