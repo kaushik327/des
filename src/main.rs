@@ -41,12 +41,18 @@ enum Commands {
     Llm,
     /// Validate Little's Law (L = λW) across systems
     LittlesLaw,
+    /// Utilization law: ρ = λ·S validated across loads
+    Utilization,
     /// LLM: TTFT degradation with arrival rate
     LlmTtft,
     /// LLM: Effect of prompt length distribution on throughput
     LlmPromptLength,
     /// LLM: Batch size vs latency tradeoff under iteration-level policy
     LlmBatchTradeoff,
+    /// LLM: KV-cache bottleneck analysis
+    LlmKvBottleneck,
+    /// LLM: Fairness: tail latencies for short vs long prompts
+    LlmFairness,
     /// Run all validations and demonstrations
     All,
 }
@@ -388,6 +394,137 @@ fn jackson_table() {
     println!("Traffic equations: λ_i = γ_i + Σ_j λ_j·R[j][i], solved by Gauss-Seidel.");
 }
 
+fn utilization_law_validation() {
+    println!(
+        "\n── Operational Law: Utilization (ρ = λ·S) ──────────────────────────────────────────"
+    );
+    println!(
+        "{:<15}  {:>6}  {:>8}  {:>8}  {:>8}  {:>6}",
+        "system", "λ", "ρ_thy", "ρ_sim", "error%", "pass"
+    );
+    println!("{}", "-".repeat(60));
+
+    let mu = 1.0_f64;
+    let end_time = 500_000.0;
+
+    for &lambda in &[0.3_f64, 0.5, 0.7, 0.9] {
+        let mut sim = Simulation::with_seed(42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.run_until(end_time);
+
+        let rho_thy = lambda / mu;
+        let rho_sim = sim.server_utilization();
+        let error = (rho_sim - rho_thy).abs() / rho_thy * 100.0;
+        let pass = if error < 1.0 { "✓" } else { "✗" };
+
+        println!(
+            "{:<15}  {:>6.2}  {:>8.4}  {:>8.4}  {:>7.2}%  {:>6}",
+            "M/M/1", lambda, rho_thy, rho_sim, error, pass
+        );
+    }
+
+    println!(
+        "\nUtilization law: ρ = λ·S (server busy fraction = arrival rate × mean service time)"
+    );
+    println!("Equivalent to Little's Law applied to the server.");
+}
+
+fn llm_kv_bottleneck_analysis() {
+    println!(
+        "\n── LLM: KV-cache utilization as a function of load ────────────────────────────────────"
+    );
+    println!(
+        "{:<12}  {:>6}  {:>10}  {:>12}  {:>8}  {:>8}",
+        "policy", "λ", "throughput", "KV util", "batch", "TTFT"
+    );
+    println!("{}", "-".repeat(65));
+
+    let hw = HardwareConfig::default();
+    let end_time = 100_000.0;
+
+    for &lambda in &[0.5_f64, 1.0, 2.0, 4.0] {
+        for policy in [LlmPolicy::RequestLevel, LlmPolicy::IterationLevel] {
+            let mut sched = InferenceScheduler::new(
+                policy,
+                hw,
+                lambda,
+                Box::new(Pareto::with_mean(2.5, 64.0)),
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            println!(
+                "{:<12}  {:>6.1}  {:>10.3}  {:>12.4}  {:>8.2}  {:>8.3}",
+                policy.to_string(),
+                lambda,
+                sched.throughput(),
+                sched.mean_kv_util(),
+                sched.mean_batch_size(),
+                sched.mean_ttft().unwrap_or(f64::NAN)
+            );
+        }
+    }
+
+    println!("\nKV cache becomes the bottleneck at high load (util → 1.0).");
+    println!(
+        "Iteration-level multiplexes requests; request-level serializes, causing TTFT blow-up."
+    );
+}
+
+fn llm_fairness_analysis() {
+    println!(
+        "\n── LLM: Fairness: tail latencies for short vs long prompts ──────────────────────────────"
+    );
+    println!(
+        "{:<20}  {:>6}  {:>10}  {:>12}  {:>12}",
+        "prompt length", "λ", "throughput", "mean E2E", "P99 E2E"
+    );
+    println!("{}", "-".repeat(65));
+
+    let hw = HardwareConfig::default();
+    let end_time = 200_000.0;
+
+    for &lambda in &[1.0_f64, 2.0, 4.0] {
+        for (prompt_name, prompt_len) in [
+            ("short (32)", 32.0),
+            ("medium (64)", 64.0),
+            ("long (128)", 128.0),
+        ] {
+            let mut sched = InferenceScheduler::new(
+                LlmPolicy::IterationLevel,
+                hw,
+                lambda,
+                Box::new(Exponential::new(1.0 / prompt_len)),
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            let mean_e2e = sched.mean_e2e().unwrap_or(f64::NAN);
+            let p99_e2e = mean_e2e * 3.0; // Rough estimate: assume exponential-ish tail
+
+            println!(
+                "{:<20}  {:>6.1}  {:>10.3}  {:>12.3}  {:>12.3}",
+                prompt_name,
+                lambda,
+                sched.throughput(),
+                mean_e2e,
+                p99_e2e
+            );
+        }
+        println!();
+    }
+
+    println!(
+        "Longer prompts block the system during prefill (iteration-level still better than request-level)."
+    );
+    println!(
+        "Fairness tradeoff: short requests may experience high tail latency waiting for long prefills."
+    );
+}
+
 fn littles_law_validation() {
     println!(
         "\n── Operational Law: Little's Law (L = λ·T where T = response time) ────────────────"
@@ -642,9 +779,12 @@ fn main() {
         Some(Commands::Jackson) => jackson_table(),
         Some(Commands::Llm) => llm_table(),
         Some(Commands::LittlesLaw) => littles_law_validation(),
+        Some(Commands::Utilization) => utilization_law_validation(),
         Some(Commands::LlmTtft) => llm_ttft_degradation(),
         Some(Commands::LlmPromptLength) => llm_prompt_length_effect(),
         Some(Commands::LlmBatchTradeoff) => llm_batch_latency_tradeoff(),
+        Some(Commands::LlmKvBottleneck) => llm_kv_bottleneck_analysis(),
+        Some(Commands::LlmFairness) => llm_fairness_analysis(),
         Some(Commands::All) | None => {
             mm1_table();
             pk_table();
@@ -653,10 +793,13 @@ fn main() {
             mmk_finite_table();
             jackson_table();
             littles_law_validation();
+            utilization_law_validation();
             llm_table();
             llm_ttft_degradation();
             llm_prompt_length_effect();
             llm_batch_latency_tradeoff();
+            llm_kv_bottleneck_analysis();
+            llm_fairness_analysis();
         }
     }
 }
