@@ -150,6 +150,53 @@ impl Distribution for Hyperexponential {
     }
 }
 
+// ── Pareto ─────────────────────────────────────────────────────────────────
+
+/// Pareto(α, x_min): heavy-tailed distribution for real-world service times.
+/// Inverse CDF: x = x_min · (1−U)^{−1/α}
+/// E[X] = α·x_min/(α−1) for α > 1; Var[X] finite only for α > 2.
+#[derive(Debug, Clone, Copy)]
+pub struct Pareto {
+    alpha: f64,
+    x_min: f64,
+}
+
+impl Pareto {
+    pub fn new(alpha: f64, x_min: f64) -> Self {
+        assert!(alpha > 0.0, "alpha must be positive, got {alpha}");
+        assert!(x_min > 0.0, "x_min must be positive, got {x_min}");
+        Self { alpha, x_min }
+    }
+
+    /// Construct with given shape α and mean E[S] = mean (requires α > 1).
+    pub fn with_mean(alpha: f64, mean: f64) -> Self {
+        assert!(alpha > 1.0, "mean is finite only for α > 1, got {alpha}");
+        Self::new(alpha, mean * (alpha - 1.0) / alpha)
+    }
+}
+
+impl Distribution for Pareto {
+    fn sample(&self, rng: &mut dyn Rng) -> f64 {
+        self.x_min * (1.0 - uniform(rng)).powf(-1.0 / self.alpha)
+    }
+
+    fn mean(&self) -> f64 {
+        if self.alpha > 1.0 {
+            self.alpha * self.x_min / (self.alpha - 1.0)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn variance(&self) -> f64 {
+        if self.alpha > 2.0 {
+            self.x_min * self.x_min * self.alpha / ((self.alpha - 1.0).powi(2) * (self.alpha - 2.0))
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +261,14 @@ mod tests {
         let verr = (var - dist.variance()).abs() / dist.variance();
         assert!(merr < TOL, "Hyperexp mean error {merr:.4}");
         assert!(verr < 0.05, "Hyperexp variance error {verr:.4}");
+    }
+
+    #[test]
+    fn pareto_mean() {
+        let dist = Pareto::with_mean(3.0, 2.0); // alpha=3, mean=2
+        let mut rng = SmallRng::seed_from_u64(5);
+        let (mean, _) = sample_stats(&dist, &mut rng);
+        let err = (mean - dist.mean()).abs() / dist.mean();
+        assert!(err < TOL, "Pareto mean error {err:.4}");
     }
 }

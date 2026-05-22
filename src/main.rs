@@ -7,8 +7,8 @@ mod server;
 mod sim;
 mod stats;
 
-use distributions::{Distribution, Erlang, Exponential, Hyperexponential};
-use sim::Simulation;
+use distributions::{Distribution, Erlang, Exponential, Hyperexponential, Pareto};
+use sim::{Policy, Simulation};
 
 /// P-K mean response time: E[T] = E[S] + λ·E[S²] / (2·(1−ρ))
 fn pk_mean(lambda: f64, dist: &dyn Distribution) -> f64 {
@@ -134,7 +134,55 @@ fn pk_table() {
     println!("theory: P-K formula E[T] = E[S] + λ·E[S²]/(2·(1−ρ)); higher CV² → higher latency");
 }
 
+fn srpt_table() {
+    println!(
+        "\n── SRPT vs FCFS on Pareto workload (α=2.5, E[S]=1) ─────────────────────────────────"
+    );
+    println!(
+        "{:<6}  {:<6}  {:>10}  {:>10}  {:>10}",
+        "ρ", "policy", "E[T] sim", "E[N] sim", "P-K lower"
+    );
+    println!("{}", "-".repeat(50));
+
+    let mu = 1.0_f64;
+    let alpha = 2.5_f64;
+    let end_time = 500_000.0;
+
+    for lambda in [0.5_f64, 0.7, 0.8, 0.9] {
+        let rho = lambda / mu;
+        // P-K lower bound (FCFS with this distribution):
+        let dist = Pareto::with_mean(alpha, 1.0 / mu);
+        let pk = dist.mean() + lambda * dist.second_moment() / (2.0 * (1.0 - rho));
+
+        for (label, policy) in [("FCFS", Policy::Fcfs), ("SRPT", Policy::Srpt)] {
+            let mut sim = Simulation::with_seed(42);
+            sim.start_arrivals(lambda);
+            sim.start_service(Pareto::with_mean(alpha, 1.0 / mu));
+            sim.set_policy(policy);
+            sim.run_until(end_time);
+
+            let et = sim.mean_response_time().unwrap_or(f64::NAN);
+            let en = sim.mean_system_size();
+            if label == "FCFS" {
+                println!(
+                    "{:<6.2}  {:<6}  {:>10.3}  {:>10.3}  {:>10.3}",
+                    rho, label, et, en, pk
+                );
+            } else {
+                println!(
+                    "{:<6.2}  {:<6}  {:>10.3}  {:>10.3}  {:>10}",
+                    rho, label, et, en, ""
+                );
+            }
+        }
+        println!();
+    }
+    println!("P-K is E[T] for FCFS (= minimum over work-conserving non-preemptive policies).");
+    println!("SRPT minimizes E[T] among all preemptive policies; gap widens with heavier load.");
+}
+
 fn main() {
     mm1_table();
     pk_table();
+    srpt_table();
 }
