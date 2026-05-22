@@ -2,8 +2,14 @@ use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
 pub enum EventKind {
-    Arrival { job_id: u64 },
-    Departure { job_id: u64, server_id: usize },
+    Arrival {
+        job_id: u64,
+    },
+    #[allow(dead_code)] // constructed when server/queueing logic is wired in
+    Departure {
+        job_id: u64,
+        server_id: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

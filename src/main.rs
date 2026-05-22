@@ -1,22 +1,22 @@
 mod calendar;
 mod clock;
+mod distributions;
 mod event;
 mod sim;
 
-use event::{Event, EventKind};
 use sim::Simulation;
 
 fn main() {
-    let mut sim = Simulation::new();
-    sim.schedule(Event::new(3.0, EventKind::Arrival { job_id: 3 }));
-    sim.schedule(Event::new(1.0, EventKind::Arrival { job_id: 1 }));
-    sim.schedule(Event::new(
-        2.5,
-        EventKind::Departure {
-            job_id: 1,
-            server_id: 0,
-        },
-    ));
-    sim.schedule(Event::new(1.5, EventKind::Arrival { job_id: 2 }));
-    sim.run_until(f64::INFINITY);
+    let lambda = 2.0;
+    let end_time = 10_000.0;
+
+    let mut sim = Simulation::with_seed(0);
+    sim.start_arrivals(lambda);
+    sim.run_until(end_time);
+
+    println!(
+        "λ={lambda}  T={end_time}  arrivals={}  empirical rate={:.4}",
+        sim.arrivals_processed,
+        sim.arrivals_processed as f64 / end_time,
+    );
 }
