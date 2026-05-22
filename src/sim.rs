@@ -27,7 +27,7 @@ pub struct Simulation {
     pub arrivals_processed: u64,
     pub drops: u64,
     pub waits: u64,
-    calendar: EventCalendar,
+    calendar: EventCalendar<Event>,
     rng: SmallRng,
     arrival_dist: Option<Exponential>,
     service_dist: Option<Box<dyn Distribution>>,

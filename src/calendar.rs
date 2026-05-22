@@ -3,6 +3,8 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
+// ── Sim-specific event types ─────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub enum EventKind {
     Arrival {
@@ -50,23 +52,37 @@ impl Ord for Event {
     }
 }
 
-/// Min-heap of future events ordered by timestamp.
-#[derive(Debug, Default)]
-pub struct EventCalendar {
-    heap: BinaryHeap<Reverse<Event>>,
+// ── Generic calendar ─────────────────────────────────────────────────────────
+
+/// Min-heap of future events ordered by `E`'s `Ord` implementation.
+///
+/// Any event type that is totally ordered by timestamp can be used; the
+/// built-in [`Event`] is for the single-node simulator, but domain-specific
+/// schedulers (e.g. `llm`) define and use their own event types.
+#[derive(Debug)]
+pub struct EventCalendar<E: Ord> {
+    heap: BinaryHeap<Reverse<E>>,
 }
 
-impl EventCalendar {
+impl<E: Ord> Default for EventCalendar<E> {
+    fn default() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+        }
+    }
+}
+
+impl<E: Ord> EventCalendar<E> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, event: Event) {
+    pub fn push(&mut self, event: E) {
         self.heap.push(Reverse(event));
     }
 
     /// Removes and returns the earliest event, or `None` if the calendar is empty.
-    pub fn pop_next(&mut self) -> Option<Event> {
+    pub fn pop_next(&mut self) -> Option<E> {
         self.heap.pop().map(|Reverse(e)| e)
     }
 }
@@ -93,7 +109,7 @@ mod tests {
 
     #[test]
     fn empty_calendar_returns_none() {
-        let mut cal = EventCalendar::new();
+        let mut cal: EventCalendar<Event> = EventCalendar::new();
         assert!(cal.pop_next().is_none());
     }
 
