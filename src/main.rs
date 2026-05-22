@@ -2,12 +2,14 @@ mod calendar;
 mod clock;
 mod distributions;
 mod event;
+mod network;
 mod queue;
 mod server;
 mod sim;
 mod stats;
 
 use distributions::{Distribution, Erlang, Exponential, Hyperexponential, Pareto};
+use network::JacksonNetwork;
 use sim::{Policy, Simulation};
 
 /// P-K mean response time: E[T] = E[S] + λ·E[S²] / (2·(1−ρ))
@@ -286,10 +288,63 @@ fn mmk_finite_table() {
     println!("Higher K: lower loss rate but higher E[T]; trade-off between latency and drop rate.");
 }
 
+fn jackson_table() {
+    println!(
+        "\n── Jackson open network: product-form validation ────────────────────────────────────"
+    );
+
+    // 3-node network:
+    //   External arrivals: γ_0=0.3, γ_1=0.1, γ_2=0.0
+    //   Routing: 0→1 with p=0.5, 0→2 with p=0.3 (exit 0.2)
+    //            1→2 with p=0.6 (exit 0.4)
+    //            2→exit (p=0.0 routing, all exit)
+    //   Service rates: μ_0=2.0, μ_1=1.5, μ_2=1.0
+    let routing = vec![
+        vec![0.0, 0.5, 0.3], // node 0: 50% → 1, 30% → 2, 20% exit
+        vec![0.0, 0.0, 0.6], // node 1: 60% → 2, 40% exit
+        vec![0.0, 0.0, 0.0], // node 2: all exit
+    ];
+    let external_rates = vec![0.3, 0.1, 0.0];
+    let service_rates = [2.0_f64, 1.5, 1.0];
+
+    let service_dists: Vec<Box<dyn Distribution>> = service_rates
+        .iter()
+        .map(|&mu| -> Box<dyn Distribution> { Box::new(Exponential::new(mu)) })
+        .collect();
+
+    let mut net = JacksonNetwork::new(service_dists, routing, external_rates.clone(), 42);
+    net.run_until(2_000_000.0);
+
+    let lam = net.effective_arrival_rates();
+
+    println!(
+        "{:<6}  {:>6}  {:>6}  {:>6}  {:>10}  {:>10}  {:>10}",
+        "node", "γ_i", "μ_i", "λ_i", "ρ_i", "E[N] sim", "E[N] thy"
+    );
+    println!("{}", "-".repeat(64));
+
+    for (i, (&mu, &lam_i)) in service_rates.iter().zip(lam.iter()).enumerate() {
+        let rho = lam_i / mu;
+        let en_thy = rho / (1.0 - rho);
+        let en_sim = net.mean_system_size(i);
+        println!(
+            "{:<6}  {:>6.2}  {:>6.2}  {:>6.3}  {:>10.4}  {:>10.4}  {:>10.4}",
+            i, external_rates[i], mu, lam_i, rho, en_sim, en_thy
+        );
+    }
+
+    if let Some(sojourn) = net.mean_sojourn() {
+        println!("\nMean network sojourn (sim): {sojourn:.4}");
+    }
+    println!("Product-form: each node is an independent M/M/1 with effective rate λ_i.");
+    println!("Traffic equations: λ_i = γ_i + Σ_j λ_j·R[j][i], solved by Gauss-Seidel.");
+}
+
 fn main() {
     mm1_table();
     pk_table();
     srpt_table();
     mmk_table();
     mmk_finite_table();
+    jackson_table();
 }
