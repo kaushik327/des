@@ -8,10 +8,39 @@ mod server;
 mod sim;
 mod stats;
 
+use clap::{Parser, Subcommand};
 use distributions::{Distribution, Erlang, Exponential, Hyperexponential, Pareto};
 use llm::{HardwareConfig, InferenceScheduler, LlmPolicy};
 use network::JacksonNetwork;
 use sim::{Policy, Simulation};
+
+#[derive(Parser)]
+#[command(name = "des")]
+#[command(about = "Discrete-Event Simulator for queueing networks and LLM inference", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run M/M/1 validation (single-server queue)
+    Mm1,
+    /// Run P-K formula validation (effect of service variance)
+    Pk,
+    /// Run SRPT vs FCFS comparison on Pareto workload
+    Srpt,
+    /// Run M/M/k validation (multi-server queue)
+    Mmk,
+    /// Run M/M/1/K validation (finite buffer)
+    MmkFinite,
+    /// Run Jackson network validation (product-form)
+    Jackson,
+    /// Run LLM inference scheduler comparison
+    Llm,
+    /// Run all validations
+    All,
+}
 
 /// P-K mean response time: E[T] = E[S] + λ·E[S²] / (2·(1−ρ))
 fn pk_mean(lambda: f64, dist: &dyn Distribution) -> f64 {
@@ -390,11 +419,24 @@ fn llm_table() {
 }
 
 fn main() {
-    mm1_table();
-    pk_table();
-    srpt_table();
-    mmk_table();
-    mmk_finite_table();
-    jackson_table();
-    llm_table();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Mm1) => mm1_table(),
+        Some(Commands::Pk) => pk_table(),
+        Some(Commands::Srpt) => srpt_table(),
+        Some(Commands::Mmk) => mmk_table(),
+        Some(Commands::MmkFinite) => mmk_finite_table(),
+        Some(Commands::Jackson) => jackson_table(),
+        Some(Commands::Llm) => llm_table(),
+        Some(Commands::All) | None => {
+            mm1_table();
+            pk_table();
+            srpt_table();
+            mmk_table();
+            mmk_finite_table();
+            jackson_table();
+            llm_table();
+        }
+    }
 }
