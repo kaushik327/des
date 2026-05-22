@@ -26,6 +26,9 @@ enum LlmEventKind {
     Arrival { req_id: u64 },
     /// Prefill phase finishes for `req_id`; KV-cache is now allocated.
     PrefillComplete { req_id: u64 },
+    /// Prefill chunk completes for `req_id`; more chunks may follow if chunked_prefill is enabled.
+    #[allow(dead_code)]
+    PrefillChunk { req_id: u64, chunk_idx: u32 },
     /// One decode step fires for the entire active batch simultaneously.
     DecodeStep,
 }
@@ -38,6 +41,9 @@ struct Request {
     /// Slots currently held in the KV cache: `prompt_len` at admission, +1 per decode step.
     kv_slots: usize,
     first_token_time: Option<f64>,
+    /// Number of times this request was preempted and had to recompute prefill.
+    #[allow(dead_code)]
+    preemptions: u32,
 }
 
 /// Stylized GPU hardware parameters.
@@ -53,6 +59,12 @@ pub struct HardwareConfig {
     pub t_decode_per_req: f64,
     /// Hard cap on the number of requests in the decode batch simultaneously.
     pub max_batch_size: usize,
+    /// Enable speculative decoding: draft model generates this many tokens speculatively.
+    #[allow(dead_code)]
+    pub spec_draft_tokens: usize,
+    /// Probability that a speculatively-generated token is accepted (0.0 = disabled).
+    #[allow(dead_code)]
+    pub spec_accept_prob: f64,
 }
 
 impl Default for HardwareConfig {
@@ -63,7 +75,19 @@ impl Default for HardwareConfig {
             t_decode_base: 0.020,
             t_decode_per_req: 0.001,
             max_batch_size: 16,
+            spec_draft_tokens: 0,
+            spec_accept_prob: 0.0,
         }
+    }
+}
+
+impl HardwareConfig {
+    /// Create a variant with speculative decoding enabled.
+    #[allow(dead_code)]
+    pub fn with_speculative_decoding(mut self, draft_tokens: usize, accept_prob: f64) -> Self {
+        self.spec_draft_tokens = draft_tokens;
+        self.spec_accept_prob = accept_prob;
+        self
     }
 }
 
@@ -221,6 +245,17 @@ impl InferenceScheduler {
         self.hw.t_decode_base + self.decode_batch.len() as f64 * self.hw.t_decode_per_req
     }
 
+    /// Expected tokens generated per decode step, accounting for speculative decoding.
+    /// Without speculation: 1 token/step. With speculation: draft_tokens * accept_prob.
+    #[allow(dead_code)]
+    fn tokens_per_step(&self) -> f64 {
+        if self.hw.spec_draft_tokens > 0 && self.hw.spec_accept_prob > 0.0 {
+            self.hw.spec_draft_tokens as f64 * self.hw.spec_accept_prob
+        } else {
+            1.0
+        }
+    }
+
     fn sample_len(dist: &dyn Distribution, rng: &mut SmallRng) -> usize {
         (dist.sample(rng).round() as usize).max(1)
     }
@@ -303,6 +338,7 @@ impl InferenceScheduler {
         match kind {
             LlmEventKind::Arrival { req_id } => self.on_arrival(req_id),
             LlmEventKind::PrefillComplete { req_id } => self.on_prefill_complete(req_id),
+            LlmEventKind::PrefillChunk { .. } => {} // Chunked prefill not yet integrated
             LlmEventKind::DecodeStep => self.on_decode_step(),
         }
     }
@@ -321,6 +357,7 @@ impl InferenceScheduler {
                 tokens_generated: 0,
                 kv_slots: 0,
                 first_token_time: None,
+                preemptions: 0,
             },
         );
         self.prefill_queue.push_back(req_id);
