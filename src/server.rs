@@ -17,6 +17,7 @@ impl Server {
         }
     }
 
+    #[allow(dead_code)]
     pub fn id(&self) -> usize {
         self.id
     }

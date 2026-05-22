@@ -181,8 +181,115 @@ fn srpt_table() {
     println!("SRPT minimizes E[T] among all preemptive policies; gap widens with heavier load.");
 }
 
+/// Erlang-C: P{an arriving job must wait} for M/M/k.
+/// `a = lambda/mu` (total offered load), `k` servers.
+fn erlang_c(k: usize, a: f64) -> f64 {
+    let rho_s = a / k as f64; // per-server utilization
+    // Iteratively compute terms of Σ_{n=0}^{k-1} a^n/n!
+    let mut sum = 0.0;
+    let mut term = 1.0; // a^0/0!
+    for n in 0..k {
+        sum += term;
+        term *= a / (n + 1) as f64;
+    }
+    // term is now a^k/k!; last_term adds the k/(k-a) factor
+    let last_term = term / (1.0 - rho_s);
+    last_term / (sum + last_term)
+}
+
+/// E[W] = C(k,a) / (k·μ - λ): mean waiting time in M/M/k queue.
+fn erlang_c_wait(k: usize, lambda: f64, mu: f64) -> f64 {
+    erlang_c(k, lambda / mu) / (k as f64 * mu - lambda)
+}
+
+fn mmk_table() {
+    println!(
+        "\n── M/M/k validation (μ=1, ρ_per_server fixed at 0.8) ───────────────────────────────"
+    );
+    println!(
+        "{:<4}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "k", "λ", "E[W] sim", "E[W] thy", "C(k,a) sim", "C(k,a) thy"
+    );
+    println!("{}", "-".repeat(60));
+
+    let mu = 1.0_f64;
+    let rho_s = 0.8_f64; // per-server utilization
+    let end_time = 500_000.0;
+
+    for k in [1_usize, 2, 4, 8] {
+        let lambda = rho_s * k as f64 * mu; // total arrival rate
+        let a = lambda / mu;
+
+        let mut sim = Simulation::with_servers(k, 42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.run_until(end_time);
+
+        // Waiting time = response time - service time = E[T] - 1/μ
+        let et_sim = sim.mean_response_time().unwrap_or(f64::NAN);
+        let ew_sim = et_sim - 1.0 / mu;
+        let ew_thy = erlang_c_wait(k, lambda, mu);
+
+        // P{wait > 0} from simulation: fraction of jobs that had to queue
+        let p_wait_sim = sim.waits as f64 / sim.arrivals_processed as f64;
+        let p_wait_thy = erlang_c(k, a);
+
+        println!(
+            "{:<4}  {:>8.2}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
+            k, lambda, ew_sim, ew_thy, p_wait_sim, p_wait_thy
+        );
+    }
+    println!("C(k,a): Erlang-C formula = P{{arriving job must wait}}; E[W] = C(k,a)/(k·μ−λ)");
+}
+
+fn mmk_finite_table() {
+    println!(
+        "\n── M/M/1/K finite buffer (μ=1, λ=0.9) ──────────────────────────────────────────────"
+    );
+    println!(
+        "{:<6}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "K", "E[T] sim", "loss sim", "loss thy", "E[N] sim"
+    );
+    println!("{}", "-".repeat(55));
+
+    let lambda = 0.9_f64;
+    let mu = 1.0_f64;
+    let rho = lambda / mu;
+    let end_time = 500_000.0;
+
+    for cap in [1_usize, 2, 4, 8, 16] {
+        let mut sim = Simulation::with_seed(42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.set_capacity(cap);
+        sim.run_until(end_time);
+
+        // M/M/1/K loss probability (Erlang-B for finite system):
+        // P_loss = ρ^K·(1-ρ) / (1-ρ^{K+1}) where K+1 = cap+1 (1 server + K waiting)
+        let k1 = cap as f64 + 1.0; // total system capacity including server
+        let p_loss_thy = if (rho - 1.0).abs() < 1e-10 {
+            1.0 / (k1 + 1.0)
+        } else {
+            rho.powf(k1) * (1.0 - rho) / (1.0 - rho.powf(k1 + 1.0))
+        };
+
+        let total = sim.arrivals_processed + sim.drops;
+        let p_loss_sim = sim.drops as f64 / total as f64;
+        let et_sim = sim.mean_response_time().unwrap_or(f64::NAN);
+        let en_sim = sim.mean_system_size();
+
+        println!(
+            "{:<6}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
+            cap, et_sim, p_loss_sim, p_loss_thy, en_sim
+        );
+    }
+    println!("Higher K: lower loss rate but higher E[T]; trade-off between latency and drop rate.");
+}
+
 fn main() {
     mm1_table();
     pk_table();
     srpt_table();
+    mmk_table();
+    mmk_finite_table();
 }

@@ -27,9 +27,10 @@ pub struct Simulation {
     arrival_dist: Option<Exponential>,
     service_dist: Option<Box<dyn Distribution>>,
     policy: Policy,
-    server: Server,
+    servers: Vec<Server>,
     queue: SimQueue,
     capacity: Option<usize>, // finite buffer (None = ∞)
+    pub waits: u64,          // jobs that had to queue (not served immediately)
     job_remaining: HashMap<u64, f64>,
     arrival_times: HashMap<u64, f64>,
     response_time: Welford,
@@ -54,16 +55,22 @@ impl Simulation {
     }
 
     pub fn with_seed(seed: u64) -> Self {
+        Self::with_servers(1, seed)
+    }
+
+    pub fn with_servers(k: usize, seed: u64) -> Self {
+        assert!(k >= 1, "must have at least one server");
         Self {
             clock: SimClock::new(),
             arrivals_processed: 0,
             drops: 0,
+            waits: 0,
             calendar: EventCalendar::new(),
             rng: SmallRng::seed_from_u64(seed),
             arrival_dist: None,
             service_dist: None,
             policy: Policy::Fcfs,
-            server: Server::new(0),
+            servers: (0..k).map(Server::new).collect(),
             queue: SimQueue::fcfs(),
             capacity: None,
             job_remaining: HashMap::new(),
@@ -77,6 +84,11 @@ impl Simulation {
             warmup_until: 0.0,
             next_job_id: 0,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn num_servers(&self) -> usize {
+        self.servers.len()
     }
 
     pub fn start_arrivals(&mut self, lambda: f64) {
@@ -118,12 +130,13 @@ impl Simulation {
         if post <= 0.0 { 0.0 } else { self.area_n / post }
     }
 
+    /// Fraction of capacity used (busy_servers / k), equals ρ = λ/(k·μ) in steady state.
     pub fn server_utilization(&self) -> f64 {
         let post = self.clock.time - self.warmup_until;
         if post <= 0.0 {
             0.0
         } else {
-            self.busy_area / post
+            self.busy_area / (self.servers.len() as f64 * post)
         }
     }
 
@@ -156,9 +169,8 @@ impl Simulation {
         if t_now > t_from {
             let dt = t_now - t_from;
             self.area_n += self.system_size as f64 * dt;
-            if !self.server.is_idle() {
-                self.busy_area += dt;
-            }
+            let busy = self.servers.iter().filter(|s| !s.is_idle()).count();
+            self.busy_area += busy as f64 * dt;
         }
         self.last_event_time = t_now;
     }
@@ -168,20 +180,25 @@ impl Simulation {
     }
 
     fn begin_service(&mut self, job_id: u64) {
+        let server_idx = self
+            .servers
+            .iter()
+            .position(|s| s.is_idle())
+            .expect("begin_service called with no idle server");
         let remaining = self.job_remaining.get(&job_id).copied().unwrap_or(0.0);
         if remaining > 0.0 {
             let departure_at = self.clock.time + remaining;
-            let epoch = self.server.begin(job_id, departure_at);
+            let epoch = self.servers[server_idx].begin(job_id, departure_at);
             self.calendar.push(Event::new(
                 departure_at,
                 EventKind::Departure {
                     job_id,
-                    server_id: self.server.id(),
+                    server_id: server_idx,
                     epoch,
                 },
             ));
         } else {
-            self.server.start_bare(job_id);
+            self.servers[server_idx].start_bare(job_id);
         }
     }
 
@@ -200,9 +217,13 @@ impl Simulation {
     fn dispatch(&mut self, event: Event) {
         match event.kind {
             EventKind::Arrival { job_id } => self.on_arrival(job_id),
-            EventKind::Departure { job_id, epoch, .. } => {
-                if self.server.is_current_epoch(epoch) {
-                    self.on_departure(job_id);
+            EventKind::Departure {
+                job_id,
+                server_id,
+                epoch,
+            } => {
+                if self.servers[server_id].is_current_epoch(epoch) {
+                    self.on_departure(job_id, server_id);
                 }
                 // else: stale event from a preempted job — discard silently
             }
@@ -232,26 +253,29 @@ impl Simulation {
             self.job_remaining.insert(job_id, size);
         }
 
-        if self.server.is_idle() {
+        let any_idle = self.servers.iter().any(|s| s.is_idle());
+        if any_idle {
             self.begin_service(job_id);
-        } else if self.policy == Policy::Srpt {
+        } else if self.policy == Policy::Srpt && self.servers.len() == 1 {
+            // Single-server SRPT preemption
             let new_remaining = self
                 .job_remaining
                 .get(&job_id)
                 .copied()
                 .unwrap_or(f64::INFINITY);
-            let current_remaining = self.server.departure_time - self.clock.time;
+            let current_remaining = self.servers[0].departure_time - self.clock.time;
             if new_remaining < current_remaining {
-                // Preempt: put current job back with updated remaining time
-                let current_job = self.server.current_job().unwrap();
-                self.server.finish();
+                let current_job = self.servers[0].current_job().unwrap();
+                self.servers[0].finish();
                 self.job_remaining.insert(current_job, current_remaining);
                 self.queue.push(current_job, current_remaining);
                 self.begin_service(job_id);
             } else {
+                self.waits += 1;
                 self.queue.push(job_id, new_remaining);
             }
         } else {
+            self.waits += 1;
             let remaining = self.job_remaining.get(&job_id).copied().unwrap_or(0.0);
             self.queue.push(job_id, remaining);
         }
@@ -259,10 +283,10 @@ impl Simulation {
         self.schedule_next_arrival();
     }
 
-    fn on_departure(&mut self, job_id: u64) {
+    fn on_departure(&mut self, job_id: u64, server_id: usize) {
         self.update_time_stats();
         self.system_size -= 1;
-        self.server.finish();
+        self.servers[server_id].finish();
         self.job_remaining.remove(&job_id);
 
         if let Some(t_arrive) = self.arrival_times.remove(&job_id)
