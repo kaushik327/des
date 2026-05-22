@@ -17,7 +17,7 @@ pub struct Simulation {
     calendar: EventCalendar,
     rng: SmallRng,
     arrival_dist: Option<Exponential>,
-    service_dist: Option<Exponential>,
+    service_dist: Option<Box<dyn Distribution>>,
     server: Server,
     queue: FcfsQueue,
     // per-job arrival timestamps for response-time accounting
@@ -75,9 +75,9 @@ impl Simulation {
         self.schedule_next_arrival();
     }
 
-    /// Set exponential service rate `mu` for the single server.
-    pub fn start_service(&mut self, mu: f64) {
-        self.service_dist = Some(Exponential::new(mu));
+    /// Set the service-time distribution.
+    pub fn start_service(&mut self, dist: impl Distribution + 'static) {
+        self.service_dist = Some(Box::new(dist));
     }
 
     /// Discard all observations before `until` simulated time.
@@ -167,7 +167,7 @@ impl Simulation {
     }
 
     fn schedule_departure(&mut self, job_id: u64) {
-        if let Some(dist) = self.service_dist {
+        if let Some(ref dist) = self.service_dist {
             let dt = dist.sample(&mut self.rng);
             self.calendar.push(Event::new(
                 self.clock.time + dt,
@@ -296,7 +296,7 @@ mod tests {
         let rho = lambda / mu;
         let mut sim = Simulation::with_seed(7);
         sim.start_arrivals(lambda);
-        sim.start_service(mu);
+        sim.start_service(Exponential::new(mu));
         sim.run_until(500_000.0);
         let util = sim.server_utilization();
         let err = (util - rho).abs() / rho;
