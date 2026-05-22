@@ -1,6 +1,7 @@
 mod calendar;
 mod clock;
 mod distributions;
+mod llm;
 mod network;
 mod queue;
 mod server;
@@ -8,6 +9,7 @@ mod sim;
 mod stats;
 
 use distributions::{Distribution, Erlang, Exponential, Hyperexponential, Pareto};
+use llm::{HardwareConfig, InferenceScheduler, LlmPolicy};
 use network::JacksonNetwork;
 use sim::{Policy, Simulation};
 
@@ -339,6 +341,54 @@ fn jackson_table() {
     println!("Traffic equations: λ_i = γ_i + Σ_j λ_j·R[j][i], solved by Gauss-Seidel.");
 }
 
+fn llm_table() {
+    println!(
+        "\n── LLM inference: request-level vs iteration-level (Orca) scheduling ───────────────"
+    );
+    println!(
+        "{:<13}  {:>5}  {:>8}  {:>8}  {:>10}  {:>7}  {:>7}",
+        "policy", "λ", "TTFT", "E2E", "throughput", "KV util", "batch"
+    );
+    println!("{}", "-".repeat(62));
+
+    let hw = HardwareConfig::default();
+    // Prompt lengths: Pareto(α=2.5, mean≈64 tokens) — heavy-tailed, realistic.
+    // Output lengths: Exponential(mean=64 tokens).
+    let end_time = 100_000.0_f64;
+
+    for lambda in [0.5_f64, 1.0, 2.0, 4.0] {
+        for policy in [LlmPolicy::RequestLevel, LlmPolicy::IterationLevel] {
+            let mut sched = InferenceScheduler::new(
+                policy,
+                hw,
+                lambda,
+                Box::new(Pareto::with_mean(2.5, 64.0)),
+                Box::new(Exponential::new(1.0 / 64.0)),
+                42,
+            );
+            sched.run_until(end_time);
+
+            println!(
+                "{:<13}  {:>5.1}  {:>8.3}  {:>8.3}  {:>10.3}  {:>7.4}  {:>7.2}",
+                policy.to_string(),
+                lambda,
+                sched.mean_ttft().unwrap_or(f64::NAN),
+                sched.mean_e2e().unwrap_or(f64::NAN),
+                sched.throughput(),
+                sched.mean_kv_util(),
+                sched.mean_batch_size(),
+            );
+        }
+        println!();
+    }
+    println!(
+        "TTFT = time-to-first-token; E2E = arrival→last token; batch = mean decode batch size."
+    );
+    println!(
+        "Iter-level admits new requests at every decode step; request-level waits for full completion."
+    );
+}
+
 fn main() {
     mm1_table();
     pk_table();
@@ -346,4 +396,5 @@ fn main() {
     mmk_table();
     mmk_finite_table();
     jackson_table();
+    llm_table();
 }
