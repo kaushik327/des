@@ -53,6 +53,10 @@ enum Commands {
     LlmKvBottleneck,
     /// LLM: Fairness: tail latencies for short vs long prompts
     LlmFairness,
+    /// Response time law: R = S + W decomposition
+    ResponseTimeLaw,
+    /// Throughput scaling with server count (M/M/k)
+    ScalingWithServers,
     /// Run all validations and demonstrations
     All,
 }
@@ -525,6 +529,78 @@ fn llm_fairness_analysis() {
     );
 }
 
+fn response_time_law() {
+    println!(
+        "\n── Operational Law: Response Time Decomposition (R = S + W) ─────────────────────────────"
+    );
+    println!(
+        "{:<15}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>6}",
+        "system", "λ", "E[T] obs", "E[S]", "E[W]", "E[S+W]", "error%"
+    );
+    println!("{}", "-".repeat(75));
+
+    let mu = 1.0_f64;
+    let end_time = 500_000.0;
+
+    for &lambda in &[0.3_f64, 0.5, 0.7, 0.9] {
+        let mut sim = Simulation::with_seed(42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.run_until(end_time);
+
+        let et_sim = sim.mean_response_time().unwrap_or(f64::NAN);
+        let es = 1.0 / mu;
+        let ew_decomp = et_sim - es; // E[W] = E[T] - E[S]
+        let decomp_sum = es + ew_decomp;
+        let error = (et_sim - decomp_sum).abs() / et_sim * 100.0;
+
+        println!(
+            "{:<15}  {:>6.2}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}  {:>5.2}%",
+            "M/M/1", lambda, et_sim, es, ew_decomp, decomp_sum, error
+        );
+    }
+
+    println!("\nResponse time law: R = S + W (response = service + wait)");
+    println!("Fundamental for understanding where latency comes from in queueing systems.");
+}
+
+fn scaling_with_servers() {
+    println!(
+        "\n── Throughput scaling with server count (M/M/k with fixed per-server ρ) ─────────────"
+    );
+    println!(
+        "{:<4}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "k", "λ", "throughput", "mean wait", "E[W] thy", "util"
+    );
+    println!("{}", "-".repeat(65));
+
+    let mu = 1.0_f64;
+    let rho_s = 0.8_f64; // per-server utilization target
+    let end_time = 500_000.0;
+
+    for k in [1_usize, 2, 4, 8] {
+        let lambda = rho_s * k as f64 * mu;
+
+        let mut sim = Simulation::with_servers(k, 42);
+        sim.start_arrivals(lambda);
+        sim.start_service(Exponential::new(mu));
+        sim.run_until(end_time);
+
+        let et_sim = sim.mean_response_time().unwrap_or(f64::NAN);
+        let ew_sim = et_sim - 1.0 / mu;
+        let ew_thy = erlang_c_wait(k, lambda, mu);
+        let util = sim.server_utilization();
+
+        println!(
+            "{:<4}  {:>8.2}  {:>10.3}  {:>10.4}  {:>10.4}  {:>10.4}",
+            k, lambda, lambda, ew_sim, ew_thy, util
+        );
+    }
+
+    println!("\nAdding servers dramatically reduces waiting time (W ∝ 1/k³ for M/M/k).");
+    println!("Throughput scales linearly with k; queue length shrinks superlinearly.");
+}
+
 fn littles_law_validation() {
     println!(
         "\n── Operational Law: Little's Law (L = λ·T where T = response time) ────────────────"
@@ -785,6 +861,8 @@ fn main() {
         Some(Commands::LlmBatchTradeoff) => llm_batch_latency_tradeoff(),
         Some(Commands::LlmKvBottleneck) => llm_kv_bottleneck_analysis(),
         Some(Commands::LlmFairness) => llm_fairness_analysis(),
+        Some(Commands::ResponseTimeLaw) => response_time_law(),
+        Some(Commands::ScalingWithServers) => scaling_with_servers(),
         Some(Commands::All) | None => {
             mm1_table();
             pk_table();
@@ -794,6 +872,8 @@ fn main() {
             jackson_table();
             littles_law_validation();
             utilization_law_validation();
+            response_time_law();
+            scaling_with_servers();
             llm_table();
             llm_ttft_degradation();
             llm_prompt_length_effect();
