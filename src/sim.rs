@@ -8,12 +8,12 @@ use crate::distributions::{Distribution, Exponential};
 use crate::event::{Event, EventKind};
 use crate::queue::FcfsQueue;
 use crate::server::Server;
+use crate::stats::{EmpiricalCdf, Welford};
 
 #[derive(Debug)]
 pub struct Simulation {
     pub clock: SimClock,
     pub arrivals_processed: u64,
-    pub jobs_completed: u64,
     calendar: EventCalendar,
     rng: SmallRng,
     arrival_dist: Option<Exponential>,
@@ -22,11 +22,14 @@ pub struct Simulation {
     queue: FcfsQueue,
     // per-job arrival timestamps for response-time accounting
     arrival_times: HashMap<u64, f64>,
-    // running totals for sample averages (post-warmup only)
-    total_response_time: f64,
+    // post-warmup sample stats for response time
+    response_time: Welford,
+    response_time_cdf: EmpiricalCdf,
     // time-average of system size N (queue + server), post-warmup
     system_size: u64,
     area_n: f64,
+    // time-average of server busy fraction, post-warmup
+    busy_area: f64,
     last_event_time: f64,
     // discard observations before this simulated time (0 = no warmup)
     warmup_until: f64,
@@ -48,7 +51,6 @@ impl Simulation {
         Self {
             clock: SimClock::new(),
             arrivals_processed: 0,
-            jobs_completed: 0,
             calendar: EventCalendar::new(),
             rng: SmallRng::seed_from_u64(seed),
             arrival_dist: None,
@@ -56,9 +58,11 @@ impl Simulation {
             server: Server::new(0),
             queue: FcfsQueue::new(),
             arrival_times: HashMap::new(),
-            total_response_time: 0.0,
+            response_time: Welford::new(),
+            response_time_cdf: EmpiricalCdf::new(),
             system_size: 0,
             area_n: 0.0,
+            busy_area: 0.0,
             last_event_time: 0.0,
             warmup_until: 0.0,
             next_job_id: 0,
@@ -83,9 +87,14 @@ impl Simulation {
         self.warmup_until = until;
     }
 
-    /// Mean response time (sojourn time) across all completed jobs.
+    /// Mean response time (sojourn time) across all post-warmup completed jobs.
     pub fn mean_response_time(&self) -> Option<f64> {
-        (self.jobs_completed > 0).then(|| self.total_response_time / self.jobs_completed as f64)
+        self.response_time.mean()
+    }
+
+    /// Standard deviation of response time across all post-warmup completed jobs.
+    pub fn response_time_std_dev(&self) -> Option<f64> {
+        self.response_time.std_dev()
     }
 
     /// Time-averaged mean number of jobs in the system (queue + server).
@@ -95,6 +104,21 @@ impl Simulation {
             return 0.0;
         }
         self.area_n / post_warmup_time
+    }
+
+    /// Time-averaged server utilization (fraction of time server is busy).
+    pub fn server_utilization(&self) -> f64 {
+        let post_warmup_time = self.clock.time - self.warmup_until;
+        if post_warmup_time <= 0.0 {
+            return 0.0;
+        }
+        self.busy_area / post_warmup_time
+    }
+
+    /// P{T > threshold} from the empirical response-time distribution.
+    pub fn tail_prob(&mut self, threshold: f64) -> f64 {
+        self.response_time_cdf.finish();
+        self.response_time_cdf.tail_prob(threshold)
     }
 
     #[allow(dead_code)] // used by tests and for manually seeding non-Poisson events
@@ -121,7 +145,11 @@ impl Simulation {
         let t_from = self.last_event_time.max(self.warmup_until);
         let t_now = self.clock.time;
         if t_now > t_from {
-            self.area_n += self.system_size as f64 * (t_now - t_from);
+            let dt = t_now - t_from;
+            self.area_n += self.system_size as f64 * dt;
+            if !self.server.is_idle() {
+                self.busy_area += dt;
+            }
         }
         self.last_event_time = t_now;
     }
@@ -188,8 +216,9 @@ impl Simulation {
         if let Some(t_arrive) = self.arrival_times.remove(&job_id)
             && t_arrive >= self.warmup_until
         {
-            self.total_response_time += self.clock.time - t_arrive;
-            self.jobs_completed += 1;
+            let sojourn = self.clock.time - t_arrive;
+            self.response_time.update(sojourn);
+            self.response_time_cdf.push(sojourn);
         }
 
         if let Some(next_job) = self.queue.pop() {
@@ -257,6 +286,23 @@ mod tests {
         assert!(
             err < 0.01,
             "rate error {err:.4} > 0.01 (got {empirical_rate:.4}, expected {lambda})"
+        );
+    }
+
+    #[test]
+    fn server_utilization_matches_rho() {
+        let lambda = 0.7_f64;
+        let mu = 1.0_f64;
+        let rho = lambda / mu;
+        let mut sim = Simulation::with_seed(7);
+        sim.start_arrivals(lambda);
+        sim.start_service(mu);
+        sim.run_until(500_000.0);
+        let util = sim.server_utilization();
+        let err = (util - rho).abs() / rho;
+        assert!(
+            err < 0.01,
+            "utilization error {err:.4} (got {util:.4}, expected {rho:.4})"
         );
     }
 }
