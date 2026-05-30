@@ -20,22 +20,22 @@ cargo run
 
 Run a specific validation:
 ```bash
-cargo run -- littles-law            # Little's Law (L = λT)
-cargo run -- utilization-law        # Utilization law (ρ = λS)
-cargo run -- response-time          # Response time law (R = S + W)
-cargo run -- scaling-with-servers   # Multi-server scaling (M/M/k)
-cargo run -- pk                     # Pollaczek-Khinchine formula (M/G/1)
-cargo run -- srpt                   # SRPT vs FCFS on Pareto workload
-cargo run -- jackson                # Jackson open network (product-form)
-cargo run -- mm-bottleneck          # Multi-server bottleneck effects
-cargo run -- erlang-c               # Erlang-C formula validation
-cargo run -- erlang-b               # Erlang-B blocking probability
-cargo run -- llm                    # LLM inference scheduler comparison
-cargo run -- llm-ttft-degradation   # TTFT collapse at high load
-cargo run -- llm-prompt-length      # Effect of prompt length distribution
-cargo run -- llm-batch-latency      # Batch size vs latency tradeoffs
-cargo run -- llm-kv-bottleneck      # KV-cache utilization analysis
-cargo run -- llm-fairness           # Tail latency fairness (short vs long prompts)
+cargo run -- mm1                  # M/M/1 queue validation
+cargo run -- pk                   # P-K formula: effect of service variance
+cargo run -- srpt                 # SRPT vs FCFS on Pareto workload
+cargo run -- mmk                  # M/M/k multi-server queue
+cargo run -- mmk-finite           # M/M/1/K finite buffer
+cargo run -- jackson              # Jackson open network (product-form)
+cargo run -- littles-law          # Little's Law (L = λT)
+cargo run -- utilization          # Utilization law (ρ = λS)
+cargo run -- response-time-law    # Response time law (R = S + W)
+cargo run -- scaling-with-servers # Multi-server throughput scaling
+cargo run -- llm                  # LLM inference scheduler comparison
+cargo run -- llm-ttft             # TTFT collapse at high load
+cargo run -- llm-prompt-length    # Effect of prompt length distribution
+cargo run -- llm-batch-tradeoff   # Batch size vs latency tradeoffs
+cargo run -- llm-kv-bottleneck    # KV-cache utilization analysis
+cargo run -- llm-fairness         # Tail latency fairness (short vs long prompts)
 ```
 
 ## Validation Results
@@ -44,11 +44,11 @@ cargo run -- llm-fairness           # Tail latency fairness (short vs long promp
 
 | Scenario | Max Error | Theory |
 |----------|-----------|--------|
-| M/M/1 (ρ: 0.5→0.95) | 0.04% | `E[T] = 1/(μ - λ)`, `E[N] = ρ/(1-ρ)` |
-| P-K Formula (Exp, Erlang, Pareto) | 0.05% | `E[T] = E[S] + λE[S²]/(2(1-ρ))` |
+| M/M/1 (ρ: 0.5→0.99) | 0.04% | `E[T] = 1/(μ - λ)`, `E[N] = ρ/(1-ρ)` |
+| P-K Formula (Erlang, Exp, Hyperexp) | 0.05% | `E[T] = E[S] + λE[S²]/(2(1-ρ))` |
 | SRPT vs FCFS (Pareto, ρ=0.5→0.9) | <0.1% | SRPT provably optimal for M/G/1 |
-| M/M/k (k=1→8) | 0.02% | Erlang-C formula |
-| Jackson Network (open, 2 nodes) | 0.08% | Product-form solution |
+| M/M/k (k=1,2,4,8) | 0.02% | Erlang-C formula |
+| Jackson Network (open, 3 nodes) | 0.08% | Product-form solution |
 | Response Time Law (all systems) | 0% | R = S + W is an identity |
 
 ### LLM Scheduling: Request-Level vs Iteration-Level (λ=4.0 reqs/sec)
