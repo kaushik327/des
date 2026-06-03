@@ -1,15 +1,24 @@
 //! LLM inference scheduler simulator.
 //!
-//! Models the two-phase request lifecycle (prefill → per-token decode) with a
-//! shared KV-cache capacity constraint.  Two scheduling policies are compared:
+//! Uses a single shared-GPU model: prefill and decode are processed sequentially
+//! in GPU "iterations", matching real serving systems.  Two regimes:
 //!
-//! - **Request-level**: one request occupies the decode batch at a time; the
-//!   next is admitted only after the current finishes all output tokens.
-//! - **Iteration-level (Orca)**: after every decode step, any waiting requests
-//!   that fit in remaining KV-cache are admitted to the batch immediately.
+//! - **`chunk_size == 0` (Orca)**: each iteration is either a full-prompt prefill
+//!   OR a decode step.  A long prompt monopolises the GPU for its entire prefill
+//!   duration, stalling every in-flight decode request for that period.
 //!
-//! Hardware parameters are stylized rather than tied to a specific GPU; results
-//! should be read as relative comparisons between policies.
+//! - **`chunk_size > 0` (Sarathi-Serve)**: each iteration processes one fixed-size
+//!   chunk of the prompt then a decode step for the active batch.  The active
+//!   request continues its chunks without yielding to new arrivals — identical to
+//!   the reference system.  Decode stall per iteration is bounded by
+//!   `chunk_size × t_prefill_per_token`.
+//!
+//! Two admission policies control when a prefilled request enters the decode batch:
+//!
+//! - **`RequestLevel`**: the next request is admitted only when the batch drains
+//!   completely (one-at-a-time serialisation).
+//! - **`IterationLevel`** (Orca): new requests are admitted at every iteration
+//!   boundary as soon as KV-cache space is available.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -18,19 +27,15 @@ use rand::{SeedableRng, rngs::SmallRng};
 use crate::calendar::{Event, EventCalendar};
 use crate::clock::SimClock;
 use crate::distributions::{Distribution, Exponential};
-use crate::stats::Welford;
+use crate::stats::{EmpiricalCdf, Welford};
 
 #[derive(Debug, Clone)]
 enum LlmEventKind {
-    /// A new inference request arrives at the system.
-    Arrival { req_id: u64 },
-    /// Prefill phase finishes for `req_id`; KV-cache is now allocated.
-    PrefillComplete { req_id: u64 },
-    /// Prefill chunk completes for `req_id`; more chunks may follow if chunked_prefill is enabled.
-    #[allow(dead_code)]
-    PrefillChunk { req_id: u64, chunk_idx: u32 },
-    /// One decode step fires for the entire active batch simultaneously.
-    DecodeStep,
+    Arrival {
+        req_id: u64,
+    },
+    /// One GPU iteration: one prefill chunk (if any), then one decode step (if not blocked).
+    Iteration,
 }
 
 struct Request {
@@ -38,12 +43,10 @@ struct Request {
     prompt_len: usize,
     output_len: usize,
     tokens_generated: usize,
-    /// Slots currently held in the KV cache: `prompt_len` at admission, +1 per decode step.
+    tokens_prefilled: usize,
+    /// KV-cache slots held: `prompt_len` at admission, +1 per decode step.
     kv_slots: usize,
     first_token_time: Option<f64>,
-    /// Number of times this request was preempted and had to recompute prefill.
-    #[allow(dead_code)]
-    preemptions: u32,
 }
 
 /// Stylized GPU hardware parameters.
@@ -51,20 +54,23 @@ struct Request {
 pub struct HardwareConfig {
     /// Total KV-cache capacity in tokens across all concurrently active requests.
     pub kv_capacity: usize,
-    /// Compute time to prefill a single prompt token.
+    /// GPU time to process one prompt token during prefill.
     pub t_prefill_per_token: f64,
     /// Base decode step latency (memory-bandwidth bound, independent of batch size).
     pub t_decode_base: f64,
-    /// Additional per-request overhead per decode step (attention over KV-cache).
+    /// Additional per-request overhead per decode step (KV-cache attention cost).
     pub t_decode_per_req: f64,
     /// Hard cap on the number of requests in the decode batch simultaneously.
     pub max_batch_size: usize,
-    /// Enable speculative decoding: draft model generates this many tokens speculatively.
-    #[allow(dead_code)]
-    pub spec_draft_tokens: usize,
-    /// Probability that a speculatively-generated token is accepted (0.0 = disabled).
-    #[allow(dead_code)]
-    pub spec_accept_prob: f64,
+    /// Tokens prefilled per GPU iteration.
+    ///
+    /// `0` = Orca-style: the full prompt is prefilled atomically, blocking decode
+    /// for the entire prefill duration (`prompt_len × t_prefill_per_token`).
+    ///
+    /// `> 0` = Sarathi-Serve: one chunk per iteration, then a decode step runs
+    /// in the same iteration.  Decode stall is bounded by
+    /// `chunk_size × t_prefill_per_token` per iteration.
+    pub chunk_size: usize,
 }
 
 impl Default for HardwareConfig {
@@ -75,28 +81,17 @@ impl Default for HardwareConfig {
             t_decode_base: 0.020,
             t_decode_per_req: 0.001,
             max_batch_size: 16,
-            spec_draft_tokens: 0,
-            spec_accept_prob: 0.0,
+            chunk_size: 0,
         }
     }
 }
 
-impl HardwareConfig {
-    /// Create a variant with speculative decoding enabled.
-    #[allow(dead_code)]
-    pub fn with_speculative_decoding(mut self, draft_tokens: usize, accept_prob: f64) -> Self {
-        self.spec_draft_tokens = draft_tokens;
-        self.spec_accept_prob = accept_prob;
-        self
-    }
-}
-
-/// Scheduling policy for the decode batch.
+/// Admission policy: when can a prefilled request enter the decode batch?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmPolicy {
-    /// One request at a time; next admitted only when the current finishes all decode.
+    /// Admit only when the decode batch is completely empty (one request at a time).
     RequestLevel,
-    /// Orca-style: at every decode step admit all waiting requests that fit in KV-cache.
+    /// Admit at every iteration boundary as long as KV-cache and batch limits allow.
     IterationLevel,
 }
 
@@ -111,9 +106,9 @@ impl std::fmt::Display for LlmPolicy {
 
 /// LLM inference scheduler simulator.
 ///
-/// Arrival → prefill queue → prefill (single-threaded) → KV-wait queue →
-/// decode batch → completion.  Prefill and decode run concurrently on separate
-/// resources, matching real serving systems.
+/// The GPU is modelled as a sequential resource.  A single `Iteration` event
+/// drives both prefill and decode: prefill chunk first (if any), then a decode
+/// step (unless an unchunked prefill blocked the GPU).
 pub struct InferenceScheduler {
     pub clock: SimClock,
     hw: HardwareConfig,
@@ -123,18 +118,13 @@ pub struct InferenceScheduler {
     requests: HashMap<u64, Request>,
     next_req_id: u64,
 
-    /// Requests waiting to be prefilled, in arrival order.
     prefill_queue: VecDeque<u64>,
-    /// The request currently being prefilled, if any.
+    /// The request currently being chunked across iterations; `None` when no prefill is active.
     being_prefilled: Option<u64>,
-
-    /// Requests whose prefill is done but that cannot yet enter the decode batch.
     kv_wait: VecDeque<u64>,
-    /// Requests currently in the decode batch.
     decode_batch: Vec<u64>,
-    /// Whether a `DecodeStep` event is already queued in the calendar.
-    decode_step_scheduled: bool,
-    /// Total KV-cache slots currently in use.
+    /// Prevents double-scheduling of `Iteration` events.
+    iteration_scheduled: bool,
     kv_used: usize,
 
     rng: SmallRng,
@@ -144,7 +134,13 @@ pub struct InferenceScheduler {
 
     pub completed: u64,
     ttft_stats: Welford,
+    ttft_cdf: EmpiricalCdf,
     e2e_stats: Welford,
+    /// Wall-clock interval between consecutive decode steps.
+    /// Spikes during unchunked prefills (Orca); bounded by chunk_size×t_prefill (Sarathi-Serve).
+    step_lat_stats: Welford,
+    step_lat_cdf: EmpiricalCdf,
+    last_decode_time: f64,
     kv_area: f64,
     batch_area: f64,
     last_event_time: f64,
@@ -170,7 +166,7 @@ impl InferenceScheduler {
             being_prefilled: None,
             kv_wait: VecDeque::new(),
             decode_batch: Vec::new(),
-            decode_step_scheduled: false,
+            iteration_scheduled: false,
             kv_used: 0,
             rng: SmallRng::seed_from_u64(seed),
             arrival_dist: Exponential::new(lambda),
@@ -178,7 +174,11 @@ impl InferenceScheduler {
             output_dist,
             completed: 0,
             ttft_stats: Welford::new(),
+            ttft_cdf: EmpiricalCdf::new(),
             e2e_stats: Welford::new(),
+            step_lat_stats: Welford::new(),
+            step_lat_cdf: EmpiricalCdf::new(),
+            last_decode_time: 0.0,
             kv_area: 0.0,
             batch_area: 0.0,
             last_event_time: 0.0,
@@ -198,17 +198,21 @@ impl InferenceScheduler {
         }
     }
 
-    /// Mean time-to-first-token across completed requests.
+    // ── Metrics ───────────────────────────────────────────────────────────────
+
     pub fn mean_ttft(&self) -> Option<f64> {
         self.ttft_stats.mean()
     }
 
-    /// Mean end-to-end latency (arrival → last output token) across completed requests.
     pub fn mean_e2e(&self) -> Option<f64> {
         self.e2e_stats.mean()
     }
 
-    /// Completed requests per unit of simulated time.
+    pub fn p99_ttft(&mut self) -> Option<f64> {
+        self.ttft_stats.mean()?;
+        Some(self.ttft_cdf.percentile(0.99))
+    }
+
     pub fn throughput(&self) -> f64 {
         if self.clock.time <= 0.0 {
             return 0.0;
@@ -216,7 +220,6 @@ impl InferenceScheduler {
         self.completed as f64 / self.clock.time
     }
 
-    /// Time-averaged fraction of KV-cache capacity occupied.
     pub fn mean_kv_util(&self) -> f64 {
         if self.clock.time <= 0.0 {
             return 0.0;
@@ -224,13 +227,25 @@ impl InferenceScheduler {
         self.kv_area / (self.clock.time * self.hw.kv_capacity as f64)
     }
 
-    /// Time-averaged number of requests concurrently decoding.
     pub fn mean_batch_size(&self) -> f64 {
         if self.clock.time <= 0.0 {
             return 0.0;
         }
         self.batch_area / self.clock.time
     }
+
+    pub fn mean_step_latency(&self) -> Option<f64> {
+        self.step_lat_stats.mean()
+    }
+
+    /// P99 wall-clock gap between consecutive decode steps.
+    /// With `chunk_size == 0` this equals the P99 prefill duration (worst-case freeze).
+    pub fn p99_step_latency(&mut self) -> Option<f64> {
+        self.step_lat_stats.mean()?;
+        Some(self.step_lat_cdf.percentile(0.99))
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn update_time_stats(&mut self) {
         let dt = self.clock.time - self.last_event_time;
@@ -243,17 +258,6 @@ impl InferenceScheduler {
 
     fn decode_step_time(&self) -> f64 {
         self.hw.t_decode_base + self.decode_batch.len() as f64 * self.hw.t_decode_per_req
-    }
-
-    /// Expected tokens generated per decode step, accounting for speculative decoding.
-    /// Without speculation: 1 token/step. With speculation: draft_tokens * accept_prob.
-    #[allow(dead_code)]
-    fn tokens_per_step(&self) -> f64 {
-        if self.hw.spec_draft_tokens > 0 && self.hw.spec_accept_prob > 0.0 {
-            self.hw.spec_draft_tokens as f64 * self.hw.spec_accept_prob
-        } else {
-            1.0
-        }
     }
 
     fn sample_len(dist: &dyn Distribution, rng: &mut SmallRng) -> usize {
@@ -274,47 +278,69 @@ impl InferenceScheduler {
         if self.being_prefilled.is_some() {
             return;
         }
-        if let Some(req_id) = self.prefill_queue.pop_front() {
-            let prompt_len = self.requests[&req_id].prompt_len;
-            let done_at = self.clock.time + prompt_len as f64 * self.hw.t_prefill_per_token;
-            self.being_prefilled = Some(req_id);
-            self.calendar.push(Event::new(
-                done_at,
-                LlmEventKind::PrefillComplete { req_id },
-            ));
+        while let Some(req_id) = self.prefill_queue.pop_front() {
+            if self.requests.contains_key(&req_id) {
+                self.being_prefilled = Some(req_id);
+                break;
+            }
         }
     }
 
-    /// Try to move `req_id` (prefill just completed) directly into the decode batch,
-    /// or park it in `kv_wait` if constraints prevent immediate admission.
+    fn next_iteration_duration(&self) -> f64 {
+        let prefill_time = if let Some(req_id) = self.being_prefilled {
+            let req = &self.requests[&req_id];
+            let remaining = req.prompt_len - req.tokens_prefilled;
+            let chunk = if self.hw.chunk_size > 0 {
+                self.hw.chunk_size.min(remaining)
+            } else {
+                remaining
+            };
+            chunk as f64 * self.hw.t_prefill_per_token
+        } else {
+            0.0
+        };
+        let decode_blocked = prefill_time > 0.0 && self.hw.chunk_size == 0;
+        let decode_time = if !self.decode_batch.is_empty() && !decode_blocked {
+            self.decode_step_time()
+        } else {
+            0.0
+        };
+        prefill_time + decode_time
+    }
+
+    fn ensure_iteration_scheduled(&mut self) {
+        if self.iteration_scheduled {
+            return;
+        }
+        let dur = self.next_iteration_duration();
+        if dur > 0.0 {
+            self.calendar
+                .push(Event::new(self.clock.time + dur, LlmEventKind::Iteration));
+            self.iteration_scheduled = true;
+        }
+    }
+
+    fn can_admit(&self, prompt_len: usize) -> bool {
+        self.kv_used + prompt_len <= self.hw.kv_capacity
+            && self.decode_batch.len() < self.hw.max_batch_size
+            && (self.policy == LlmPolicy::IterationLevel || self.decode_batch.is_empty())
+    }
+
     fn try_admit(&mut self, req_id: u64) {
         let prompt_len = self.requests[&req_id].prompt_len;
-        let kv_ok = self.kv_used + prompt_len <= self.hw.kv_capacity;
-        let batch_ok = self.decode_batch.len() < self.hw.max_batch_size;
-        let policy_ok = self.policy == LlmPolicy::IterationLevel || self.decode_batch.is_empty();
-
-        if kv_ok && batch_ok && policy_ok {
+        if self.can_admit(prompt_len) {
             self.kv_used += prompt_len;
             self.requests.get_mut(&req_id).unwrap().kv_slots = prompt_len;
             self.decode_batch.push(req_id);
-            self.ensure_decode_scheduled();
         } else {
             self.kv_wait.push_back(req_id);
         }
     }
 
-    /// Drain `kv_wait` into the decode batch as long as KV-cache and batch-size
-    /// constraints (and policy) allow.  FCFS order is preserved within the queue.
     fn admit_waiting(&mut self) {
         while let Some(&req_id) = self.kv_wait.front() {
             let prompt_len = self.requests[&req_id].prompt_len;
-            let kv_ok = self.kv_used + prompt_len <= self.hw.kv_capacity;
-            let batch_ok = self.decode_batch.len() < self.hw.max_batch_size;
-            // RequestLevel: only admit when the batch has just drained to empty.
-            let policy_ok =
-                self.policy == LlmPolicy::IterationLevel || self.decode_batch.is_empty();
-
-            if kv_ok && batch_ok && policy_ok {
+            if self.can_admit(prompt_len) {
                 self.kv_wait.pop_front();
                 self.kv_used += prompt_len;
                 self.requests.get_mut(&req_id).unwrap().kv_slots = prompt_len;
@@ -323,23 +349,55 @@ impl InferenceScheduler {
                 break;
             }
         }
-        self.ensure_decode_scheduled();
     }
 
-    fn ensure_decode_scheduled(&mut self) {
-        if !self.decode_batch.is_empty() && !self.decode_step_scheduled {
-            let t = self.clock.time + self.decode_step_time();
-            self.calendar.push(Event::new(t, LlmEventKind::DecodeStep));
-            self.decode_step_scheduled = true;
+    fn do_decode_step(&mut self, now: f64) {
+        if self.last_decode_time > 0.0 {
+            let lat = now - self.last_decode_time;
+            self.step_lat_stats.update(lat);
+            self.step_lat_cdf.push(lat);
         }
+        self.last_decode_time = now;
+
+        self.kv_used += self.decode_batch.len();
+
+        let mut ttft_updates: Vec<f64> = Vec::new();
+        let mut completions: Vec<u64> = Vec::new();
+
+        for &req_id in &self.decode_batch {
+            let req = self.requests.get_mut(&req_id).unwrap();
+            req.tokens_generated += 1;
+            req.kv_slots += 1;
+            if req.first_token_time.is_none() {
+                req.first_token_time = Some(now);
+                ttft_updates.push(now - req.arrival_time);
+            }
+            if req.tokens_generated >= req.output_len {
+                completions.push(req_id);
+            }
+        }
+
+        for ttft in ttft_updates {
+            self.ttft_stats.update(ttft);
+            self.ttft_cdf.push(ttft);
+        }
+        for req_id in &completions {
+            let req = self.requests.remove(req_id).unwrap();
+            self.kv_used -= req.kv_slots;
+            self.e2e_stats.update(now - req.arrival_time);
+            self.completed += 1;
+        }
+        self.decode_batch.retain(|id| !completions.contains(id));
+
+        self.admit_waiting();
     }
+
+    // ── Event handlers ────────────────────────────────────────────────────────
 
     fn dispatch(&mut self, kind: LlmEventKind) {
         match kind {
             LlmEventKind::Arrival { req_id } => self.on_arrival(req_id),
-            LlmEventKind::PrefillComplete { req_id } => self.on_prefill_complete(req_id),
-            LlmEventKind::PrefillChunk { .. } => {} // Chunked prefill not yet integrated
-            LlmEventKind::DecodeStep => self.on_decode_step(),
+            LlmEventKind::Iteration => self.on_iteration(),
         }
     }
 
@@ -355,64 +413,57 @@ impl InferenceScheduler {
                 prompt_len,
                 output_len,
                 tokens_generated: 0,
+                tokens_prefilled: 0,
                 kv_slots: 0,
                 first_token_time: None,
-                preemptions: 0,
             },
         );
         self.prefill_queue.push_back(req_id);
-        self.try_start_prefill();
+        // Only claim the GPU when idle: the scheduled iteration's duration is already
+        // committed; starting a prefill now would make on_iteration process more work
+        // than that duration accounts for, skewing the clock.
+        if !self.iteration_scheduled {
+            self.try_start_prefill();
+        }
+        self.ensure_iteration_scheduled();
         self.schedule_next_arrival();
     }
 
-    fn on_prefill_complete(&mut self, req_id: u64) {
+    fn on_iteration(&mut self) {
         self.update_time_stats();
-        self.being_prefilled = None;
-        self.try_admit(req_id);
-        self.try_start_prefill();
-    }
-
-    fn on_decode_step(&mut self) {
-        self.update_time_stats();
-        self.decode_step_scheduled = false;
-
+        self.iteration_scheduled = false;
         let now = self.clock.time;
 
-        // Each request in the batch generates one token, consuming one more KV slot.
-        self.kv_used += self.decode_batch.len();
+        let prefill_was_running = self.being_prefilled.is_some();
 
-        // Collect outcomes before mutably borrowing stats accumulators.
-        let mut ttft_updates: Vec<f64> = Vec::new();
-        let mut completions: Vec<u64> = Vec::new();
+        if let Some(req_id) = self.being_prefilled {
+            let prefill_done = {
+                let req = self.requests.get_mut(&req_id).unwrap();
+                let remaining = req.prompt_len - req.tokens_prefilled;
+                let chunk = if self.hw.chunk_size > 0 {
+                    self.hw.chunk_size.min(remaining)
+                } else {
+                    remaining
+                };
+                req.tokens_prefilled += chunk;
+                req.tokens_prefilled >= req.prompt_len
+            };
 
-        for &req_id in &self.decode_batch {
-            let req = self.requests.get_mut(&req_id).unwrap();
-            req.tokens_generated += 1;
-            req.kv_slots += 1;
-
-            if req.first_token_time.is_none() {
-                req.first_token_time = Some(now);
-                ttft_updates.push(now - req.arrival_time);
+            if prefill_done {
+                self.being_prefilled = None;
+                self.try_admit(req_id);
             }
-
-            if req.tokens_generated >= req.output_len {
-                completions.push(req_id);
-            }
         }
 
-        for ttft in ttft_updates {
-            self.ttft_stats.update(ttft);
+        let decode_blocked = prefill_was_running && self.hw.chunk_size == 0;
+        if !self.decode_batch.is_empty() && !decode_blocked {
+            self.do_decode_step(now);
         }
 
-        for req_id in &completions {
-            let req = self.requests.remove(req_id).unwrap();
-            self.kv_used -= req.kv_slots;
-            self.e2e_stats.update(now - req.arrival_time);
-            self.completed += 1;
+        if self.being_prefilled.is_none() {
+            self.try_start_prefill();
         }
-        self.decode_batch.retain(|id| !completions.contains(id));
 
-        self.admit_waiting();
-        self.ensure_decode_scheduled();
+        self.ensure_iteration_scheduled();
     }
 }

@@ -54,8 +54,23 @@ impl EmpiricalCdf {
     }
 
     pub fn finish(&mut self) {
-        self.samples.sort_by(f64::total_cmp);
-        self.sorted = true;
+        if !self.sorted {
+            self.samples.sort_by(f64::total_cmp);
+            self.sorted = true;
+        }
+    }
+
+    /// p-th percentile (p in 0.0–1.0). Calls `finish` automatically.
+    pub fn percentile(&mut self, p: f64) -> f64 {
+        self.finish();
+        let n = self.samples.len();
+        if n == 0 {
+            return f64::NAN;
+        }
+        let idx = ((p * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        self.samples[idx]
     }
 
     /// P{X > threshold}. Requires `finish` to have been called.

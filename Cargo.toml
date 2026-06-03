@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 rand = "0.10.1"
 clap = { version = "4.4", features = ["derive"] }
-kuva = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

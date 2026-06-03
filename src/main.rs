@@ -1,5 +1,4 @@
 mod calendar;
-mod charts;
 mod clock;
 mod distributions;
 mod llm;
@@ -53,6 +52,10 @@ enum Commands {
     LlmKvBottleneck,
     /// LLM: Fairness: tail latencies for short vs long prompts
     LlmFairness,
+    /// LLM: Chunked prefill vs whole-prompt prefill on TTFT tail latency
+    LlmChunkedPrefill,
+    /// LLM: Decode stall — how chunked prefill prevents decode freezes (coupled GPU model)
+    LlmDecodeStall,
     /// Response time law: R = S + W decomposition
     ResponseTimeLaw,
     /// Throughput scaling with server count (M/M/k)
@@ -843,6 +846,163 @@ fn llm_table() {
     );
 }
 
+fn llm_chunked_prefill_analysis() {
+    // Prefill-bottleneck HW (t_prefill 5× slower than default, decode fast).
+    // λ=3, ρ_prefill ≈ 0.96 → heavily loaded prefill processor.
+    //
+    // Key mechanic: Orca (chunk=0) blocks decode for the entire duration of each
+    // individual prefill.  Requests in the decode batch receive no tokens while any
+    // prefill is running; at ρ=0.96 prefills arrive faster than they complete, so
+    // the blocking intervals stack and P99 TTFT blows up.
+    //
+    // Chunked prefill (chunk>0): decode is NOT blocked after a chunk.  When the last
+    // chunk of request X completes, a decode step runs in the same iteration: X's
+    // first_token_time is set immediately.  TTFT collapses to queue_wait + prefill_time.
+    //
+    // Caveat: very small chunk sizes (chunk=16) run extra decode steps per request,
+    // raising effective GPU utilisation toward 1.0 and slightly increasing mean TTFT.
+    let hw_base = HardwareConfig {
+        kv_capacity: 8192,
+        t_prefill_per_token: 0.005,
+        t_decode_base: 0.002,
+        t_decode_per_req: 0.0001,
+        max_batch_size: 64,
+        ..Default::default()
+    };
+
+    println!(
+        "\n── LLM: Chunked prefill — TTFT tail latency vs chunk size ──────────────────────────"
+    );
+    println!("   Pareto(α=2.5, mean=64) prompts, λ=3.0, prefill-bottleneck HW");
+    println!("   Prefill util ≈ 0.96; P99 prompt ≈ 242 tok → 1.21s prefill without chunking\n");
+    println!(
+        "{:<12}  {:>10}  {:>12}  {:>12}  {:>12}",
+        "chunk size", "throughput", "mean TTFT(s)", "P99 TTFT(s)", "mean E2E(s)"
+    );
+    println!("{}", "-".repeat(66));
+
+    let end_time = 200_000.0;
+    let lambda = 3.0_f64;
+
+    for chunk_size in [0_usize, 16, 32, 64, 128, 256] {
+        let hw = HardwareConfig {
+            chunk_size,
+            ..hw_base
+        };
+        let label = if chunk_size == 0 {
+            "none".to_string()
+        } else {
+            chunk_size.to_string()
+        };
+
+        let mut sched = InferenceScheduler::new(
+            LlmPolicy::IterationLevel,
+            hw,
+            lambda,
+            Box::new(Pareto::with_mean(2.5, 64.0)),
+            Box::new(Exponential::new(1.0 / 64.0)),
+            42,
+        );
+        sched.run_until(end_time);
+
+        println!(
+            "{:<12}  {:>10.3}  {:>12.1}  {:>12.1}  {:>12.1}",
+            label,
+            sched.throughput(),
+            sched.mean_ttft().unwrap_or(f64::NAN),
+            sched.p99_ttft().unwrap_or(f64::NAN),
+            sched.mean_e2e().unwrap_or(f64::NAN),
+        );
+    }
+}
+
+fn llm_decode_stall_analysis() {
+    // Sarathi-Serve motivation: without chunked prefill, a long prompt monopolises
+    // the GPU for its full prefill duration.  Every request in the decode batch is
+    // frozen — no tokens produced — for that entire period.
+    //
+    // The right metric is *per-step latency*: the wall-clock gap between consecutive
+    // decode steps.  An arrival that occurs while a decode step is in-flight waits
+    // until the decode completes, then the GPU switches to prefill.  The gap between
+    // the decode step and the NEXT decode step equals the full prefill duration
+    // (chunk_size=0) or a single chunk's duration (chunk_size>0).
+    //
+    // For P99 to reflect the prefill-blocking events, at least 1% of decode step
+    // intervals must be post-prefill gaps, which requires λ × t_decode ≥ 0.01.
+    //
+    // Stability constraint with chunked prefill: when chunk_size=C the wall-clock
+    // prefill service time = ⌈P/C⌉ × (C·t_prefill + t_decode), which grows as C
+    // shrinks (each chunk iteration "wastes" t_decode on the existing batch).
+    //
+    // Parameters:
+    //   t_prefill = 0.5ms/tok, t_decode = 20ms (baseline)
+    //   Pareto(α=2.5, mean=256) prompts; Exp(mean=128) output
+    //   λ = 1.5 req/s — all chunk sizes stable down to chunk_size=16
+    //     prefill util (no chunk) = 1.5×256×0.0005 = 0.192
+    //     chunk=16 stability limit = 1/[16×(16×0.0005+0.020)] = 2.23 req/s  > λ ✓
+    //     mean batch  ≈ 1.5×128×0.020 = 3.8 concurrent decodes
+    //     fraction of post-prefill gaps ≈ λ × t_decode = 3%  → P99 captures stall events
+    //   P99 prompt ≈ 970 tok → 485ms prefill stall without chunking (24× baseline)
+
+    let hw_base = HardwareConfig {
+        kv_capacity: 32768,
+        t_prefill_per_token: 0.0005,
+        t_decode_base: 0.020,
+        t_decode_per_req: 0.0001,
+        max_batch_size: 128,
+        ..Default::default()
+    };
+
+    println!(
+        "\n── LLM: Decode stall — Sarathi-Serve motivation (coupled GPU model) ─────────────────"
+    );
+    println!("   Pareto(α=2.5, mean=256) prompts; Exp(mean=128) output; λ=1.5");
+    println!("   t_prefill=0.5ms/tok; t_decode=20ms");
+    println!("   P99 prompt ≈ 970 tok → 485ms prefill stall without chunking (24× baseline)");
+    println!("   All chunk sizes stable (λ=1.5 < limit of 2.23 req/s for chunk_size=16)\n");
+    println!(
+        "{:<12}  {:>10}  {:>11}  {:>12}  {:>10}",
+        "chunk_size", "throughput", "mean step", "P99 step", "P99/mean×"
+    );
+    println!("{}", "-".repeat(64));
+
+    let end_time = 500_000.0;
+    let lambda = 1.5_f64;
+
+    for chunk_size in [0_usize, 16, 32, 64, 128, 256] {
+        let hw = HardwareConfig {
+            chunk_size,
+            ..hw_base
+        };
+        let label = if chunk_size == 0 {
+            "none (Orca)".to_string()
+        } else {
+            chunk_size.to_string()
+        };
+
+        let mut sched = InferenceScheduler::new(
+            LlmPolicy::IterationLevel,
+            hw,
+            lambda,
+            Box::new(Pareto::with_mean(2.5, 256.0)),
+            Box::new(Exponential::new(1.0 / 128.0)),
+            42,
+        );
+        sched.run_until(end_time);
+
+        let mean_step = sched.mean_step_latency().unwrap_or(f64::NAN);
+        let p99_step = sched.p99_step_latency().unwrap_or(f64::NAN);
+        println!(
+            "{:<12}  {:>10.3}  {:>10.3}ms  {:>11.3}ms  {:>9.1}×",
+            label,
+            sched.throughput(),
+            mean_step * 1000.0,
+            p99_step * 1000.0,
+            p99_step / mean_step,
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -861,6 +1021,8 @@ fn main() {
         Some(Commands::LlmBatchTradeoff) => llm_batch_latency_tradeoff(),
         Some(Commands::LlmKvBottleneck) => llm_kv_bottleneck_analysis(),
         Some(Commands::LlmFairness) => llm_fairness_analysis(),
+        Some(Commands::LlmChunkedPrefill) => llm_chunked_prefill_analysis(),
+        Some(Commands::LlmDecodeStall) => llm_decode_stall_analysis(),
         Some(Commands::ResponseTimeLaw) => response_time_law(),
         Some(Commands::ScalingWithServers) => scaling_with_servers(),
         Some(Commands::All) | None => {
@@ -880,6 +1042,8 @@ fn main() {
             llm_batch_latency_tradeoff();
             llm_kv_bottleneck_analysis();
             llm_fairness_analysis();
+            llm_chunked_prefill_analysis();
+            llm_decode_stall_analysis();
         }
     }
 }

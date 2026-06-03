@@ -36,6 +36,8 @@ cargo run -- llm-prompt-length    # Effect of prompt length distribution
 cargo run -- llm-batch-tradeoff   # Batch size vs latency tradeoffs
 cargo run -- llm-kv-bottleneck    # KV-cache utilization analysis
 cargo run -- llm-fairness         # Tail latency fairness (short vs long prompts)
+cargo run -- llm-chunked-prefill  # Chunked prefill vs whole-prompt on P99 TTFT
+cargo run -- llm-decode-stall     # Decode freeze: Orca vs Sarathi-Serve (P99 step latency)
 ```
 
 ## Validation Results
@@ -51,15 +53,26 @@ cargo run -- llm-fairness         # Tail latency fairness (short vs long prompts
 | Jackson Network (open, 3 nodes) | 0.08% | Product-form solution |
 | Response Time Law (all systems) | 0% | R = S + W is an identity |
 
-### LLM Scheduling: Request-Level vs Iteration-Level (λ=4.0 reqs/sec)
+### LLM Scheduling: Request-Level vs Iteration-Level / Orca (λ=2.0 reqs/sec)
 
-| Metric | Request-Level | Iteration-Level |
-|--------|---------------|-----------------|
-| TTFT (ms) | 40,690.822 | 0.138 |
-| E2E Latency (ms) | 40,691.598 | 1.904 |
-| Throughput (req/sec) | 0.745 | 3.996 |
-| KV-cache utilization | 6.2% | 44.4% |
-| Avg batch size | 1.00 | 7.11 |
+Shared-GPU model: prefill and decode run sequentially in GPU iterations.
+
+| Metric | Request-Level | Iteration-Level (Orca) |
+|--------|---------------|------------------------|
+| TTFT (ms) | 33,822 | 123 |
+| E2E Latency (ms) | 33,823 | 1,914 |
+| Throughput (req/sec) | 0.650 | 1.999 |
+| KV-cache utilization | 6.2% | 22.7% |
+| Avg batch size | 1.00 | 3.65 |
+
+### Decode Stall: Orca vs Sarathi-Serve / Chunked Prefill (λ=1.5 reqs/sec)
+
+| Chunk size | Throughput | Mean step | P99 step | P99/mean |
+|------------|------------|-----------|----------|----------|
+| none (Orca) | 1.499 | 25.7ms | 167.7ms | 6.5× |
+| 16 | 1.499 | 25.5ms | 29.1ms | 1.1× |
+| 64 | 1.499 | 25.6ms | 52.9ms | 2.1× |
+| 256 | 1.499 | 25.7ms | 148.4ms | 5.8× |
 
 ## Testing
 
